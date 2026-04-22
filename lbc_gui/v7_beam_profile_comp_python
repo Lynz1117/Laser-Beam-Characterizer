@@ -1,0 +1,2029 @@
+import os
+import subprocess
+import sys
+import threading
+import queue
+from datetime import datetime
+
+import serial
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# User settings
+# ============================================================
+PORT = "COM7"
+BAUD = 115200
+
+R_MM = 40.0
+SAVE_ROOT = "beam_profile_runs"
+
+PROFILE_INIT_COUNTS = 4650
+PROFILE_REPEAT_COUNTS = 745
+PROFILE_WAIT_COUNTS = 7000 - PROFILE_REPEAT_COUNTS
+PROFILE_EVENT_COUNTS = 7000
+NUM_REPEATED_SCANS = 10
+ADC_FS_HZ = 10000.0
+RAW_SAMPLE_DT_S = 1.0 / ADC_FS_HZ
+PROFILE_COUNTS_PER_REV = 28000
+ENCODER_TIMER_MOD = 65536
+
+SERIAL_TIMEOUT_S = 0.25
+EMPTY_LIMIT = 40
+REPEAT_EMPTY_LIMIT = 160
+
+# Processing settings
+MA_W_P = 7
+MA_W_D = 5
+EDGE_FRAC = 0.15
+MONO_SCORE_THRESH = 0.65
+EDGE_SPAN_RATIO_THRESH = 0.55
+PROFILE_THRESH_FRAC = 0.06
+PROFILE_HALF_WIN_MM = 4.5
+
+# If True, pop up every individual scan plot too.
+# Usually better to keep False and only popup averages.
+POPUP_EACH_SCAN = False
+
+# Replay test mode:
+# When enabled, START_AXIS commands launch the saved RAW_SCAN replay stream
+# instead of reading from the STM serial port.
+REPLAY_TEST_MODE = False
+REPLAY_SCRIPT = r"C:\ST\projects\PULSE_SIGNAL\replay_raw_scan_csv.py"
+REPLAY_RUN_ROOT = r"C:\Users\Lynzie\SDProject\lbc_gui\beam_profile_runs\profile_run_new_system_replay_20260415_011601"
+REPLAY_TIMING = "none"   # "none", "csv", or "fixed"
+REPLAY_SPEEDUP = 10.0
+REPLAY_FIXED_DELAY_MS = 1.0
+
+
+# ============================================================
+# Utility helpers
+# ============================================================
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def moving_average(y, w):
+    y = np.asarray(y, dtype=float)
+    if len(y) < max(3, w):
+        return y.copy()
+    if w % 2 == 0:
+        w += 1
+    pad = w // 2
+    ypad = np.pad(y, (pad, pad), mode="edge")
+    k = np.ones(w, dtype=float) / float(w)
+    return np.convolve(ypad, k, mode="valid")
+
+
+def normalize_01(y):
+    y = np.asarray(y, dtype=float)
+    y0 = np.min(y)
+    y1 = np.max(y)
+    if abs(y1 - y0) <= 1e-12:
+        return np.zeros_like(y)
+    return (y - y0) / (y1 - y0)
+
+
+def encoder_delta_counts(enc_now, enc_ref):
+    d = int(enc_now) - int(enc_ref)
+    return int(((d + (ENCODER_TIMER_MOD // 2)) % ENCODER_TIMER_MOD) - (ENCODER_TIMER_MOD // 2))
+
+
+def encoder_step_distance(enc_now, enc_ref):
+    return abs(encoder_delta_counts(enc_now, enc_ref))
+
+
+def robust_edge_levels(sig, frac=EDGE_FRAC):
+    sig = np.asarray(sig, dtype=float)
+    n = len(sig)
+    k = max(3, int(frac * n))
+    left = np.median(sig[:k])
+    right = np.median(sig[-k:])
+    return left, right
+
+
+def is_mostly_monotonic(y):
+    diag = monotonic_diagnostics(y)
+    if diag["edge_span_ratio"] >= EDGE_SPAN_RATIO_THRESH:
+        return True
+
+    if diag["mono_score"] < MONO_SCORE_THRESH and (diag["interior_peak"] or diag["interior_valley"]):
+        return False
+
+    return True
+
+
+def monotonic_diagnostics(y):
+    y = np.asarray(y, dtype=float)
+    if len(y) < 8:
+        return {
+            "mono_score": 1.0,
+            "interior_peak": False,
+            "interior_valley": False,
+            "left_level": float(y[0]) if len(y) else 0.0,
+            "right_level": float(y[-1]) if len(y) else 0.0,
+            "end_to_end": 0.0,
+            "total_var": 0.0,
+            "edge_span_ratio": 0.0,
+        }
+
+    dy = np.diff(y)
+    if np.all(np.abs(dy) < 1e-12):
+        left, right = robust_edge_levels(y)
+        return {
+            "mono_score": 1.0,
+            "interior_peak": False,
+            "interior_valley": False,
+            "left_level": float(left),
+            "right_level": float(right),
+            "end_to_end": 0.0,
+            "total_var": 0.0,
+            "edge_span_ratio": 0.0,
+        }
+
+    total_var = np.sum(np.abs(dy)) + 1e-12
+    end_to_end = abs(y[-1] - y[0])
+    mono_score = end_to_end / total_var
+    left, right = robust_edge_levels(y)
+    full_span = max(float(np.max(y) - np.min(y)), 1e-12)
+    edge_span_ratio = abs(right - left) / full_span
+
+    i_peak = int(np.argmax(y))
+    i_valley = int(np.argmin(y))
+    interior_peak = (0 < i_peak < len(y) - 1)
+    interior_valley = (0 < i_valley < len(y) - 1)
+
+    return {
+        "mono_score": float(mono_score),
+        "interior_peak": bool(interior_peak),
+        "interior_valley": bool(interior_valley),
+        "left_level": float(left),
+        "right_level": float(right),
+        "end_to_end": float(end_to_end),
+        "total_var": float(total_var),
+        "edge_span_ratio": float(edge_span_ratio),
+    }
+
+
+def knife_from_monotonic_power(p_s):
+    left, right = robust_edge_levels(p_s)
+
+    P = (p_s - left) / (right - left + 1e-12)
+    P = np.clip(P, 0.0, 1.0)
+
+    k = max(3, len(P) // 10)
+    if np.mean(P[:k]) < np.mean(P[-k:]):
+        P = 1.0 - P
+
+    P = moving_average(P, MA_W_P)
+    P = np.clip(P, 0.0, 1.0)
+    return P
+
+
+def scale_normalized_to_power(P, p_ref):
+    P = np.asarray(P, dtype=float)
+    p_ref = np.asarray(p_ref, dtype=float)
+
+    if len(P) == 0 or len(p_ref) == 0:
+        return P.copy()
+
+    p_lo = float(np.min(p_ref))
+    p_hi = float(np.max(p_ref))
+    return p_lo + P * (p_hi - p_lo)
+
+
+def average_duplicate_positions(x, *arrays):
+    x = np.asarray(x, dtype=float)
+    if len(x) == 0:
+        return x.copy(), [np.asarray(a, dtype=float).copy() for a in arrays]
+
+    x_unique, inverse, counts = np.unique(x, return_inverse=True, return_counts=True)
+    counts = counts.astype(float)
+
+    averaged = []
+    for arr in arrays:
+        arr = np.asarray(arr, dtype=float)
+        sums = np.bincount(inverse, weights=arr, minlength=len(x_unique))
+        averaged.append(sums / counts)
+
+    return x_unique, averaged
+
+
+def profile_from_hump_power(x_mm, p_s):
+    left, right = robust_edge_levels(p_s)
+    baseline = min(left, right)
+
+    prof = p_s - baseline
+    prof = np.maximum(prof, 0.0)
+    prof = moving_average(prof, MA_W_D)
+    prof = np.maximum(prof, 0.0)
+
+    if np.max(prof) > 0:
+        prof = np.where(prof >= 0.03 * np.max(prof), prof, 0.0)
+
+    dx = float(np.median(np.diff(x_mm)))
+    P_rise = np.cumsum(prof) * dx
+    P_rise = normalize_01(P_rise)
+
+    P = 1.0 - P_rise
+    P = moving_average(P, MA_W_P)
+    P = np.clip(P, 0.0, 1.0)
+
+    return P, prof
+
+
+def crossing_x_at_level(x, y, level=0.5):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if len(x) < 2:
+        return 0.0
+
+    s = y - level
+    idx = np.where(np.signbit(s[:-1]) != np.signbit(s[1:]))[0]
+    if len(idx) == 0:
+        return float(x[np.argmin(np.abs(s))])
+
+    i = idx[0]
+    x0, x1 = x[i], x[i + 1]
+    y0, y1 = y[i], y[i + 1]
+
+    if abs(y1 - y0) < 1e-12:
+        return float(x0)
+
+    return float(x0 + (level - y0) * (x1 - x0) / (y1 - y0))
+
+
+def weighted_stats_from_profile(x, prof):
+    x = np.asarray(x, dtype=float)
+    prof = np.asarray(prof, dtype=float)
+
+    prof = np.maximum(prof, 0.0)
+    s = float(np.sum(prof))
+    if s <= 0 or len(x) < 3:
+        return None, None, None
+
+    mu = float(np.sum(x * prof) / s)
+    var = float(np.sum(prof * (x - mu) ** 2) / s)
+    sigma = float(np.sqrt(max(var, 0.0)))
+    width_4sigma = 4.0 * sigma
+    return mu, sigma, width_4sigma
+
+
+def crop_main_lobe(x, profile, half_win_mm=PROFILE_HALF_WIN_MM, thresh_frac=PROFILE_THRESH_FRAC):
+    x = np.asarray(x, dtype=float)
+    profile = np.asarray(profile, dtype=float)
+
+    if len(x) < 5:
+        return x, profile
+
+    profile = np.maximum(profile, 0.0)
+    i_peak = int(np.argmax(profile))
+    x_peak = x[i_peak]
+    p_peak = profile[i_peak]
+
+    if p_peak <= 0:
+        return x, profile
+
+    keep = (x >= (x_peak - half_win_mm)) & (x <= (x_peak + half_win_mm))
+    x_c = x[keep]
+    p_c = profile[keep]
+
+    if len(x_c) < 5:
+        return x, profile
+
+    thresh = thresh_frac * np.max(p_c)
+    p_c = np.where(p_c >= thresh, p_c, 0.0)
+    return x_c, p_c
+
+
+def parse_keyvals_csv(line: str):
+    out = {}
+    parts = line.strip().split(",")
+    for p in parts[1:]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+# ============================================================
+# Initial scan / T0 helpers
+# ============================================================
+def sg_smooth_5point(y):
+    """
+    5-point Savitzky-Golay smoothing, same style as the STM32 helper.
+    For interior points:
+        y_s[i] = (-3*y[i-2] + 12*y[i-1] + 17*y[i] + 12*y[i+1] - 3*y[i+2]) / 35
+    Endpoints fall back to edge-copy behavior.
+    """
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if n < 5:
+        return y.copy()
+
+    ys = y.copy()
+
+    # Keep ends simple and stable
+    ys[0] = y[0]
+    ys[1] = y[1]
+    ys[-2] = y[-2]
+    ys[-1] = y[-1]
+
+    for i in range(2, n - 2):
+        ys[i] = (
+            -3.0 * y[i - 2]
+            + 12.0 * y[i - 1]
+            + 17.0 * y[i]
+            + 12.0 * y[i + 1]
+            - 3.0 * y[i + 2]
+        ) / 35.0
+
+    return ys
+
+
+def erf_model_idx(x_idx, x0_idx, w_idx, y_lo, y_hi):
+    """
+    Error-function model versus sample index.
+    """
+    w_idx = max(float(w_idx), 1e-9)
+    a = 0.5 * (y_hi - y_lo)
+
+    x_idx = np.asarray(x_idx, dtype=float)
+    z = (x_idx - float(x0_idx)) / w_idx
+
+    # numpy may not have vectorized erf in all environments, so use list comprehension
+    erf_vals = np.array([math.erf(val) for val in z], dtype=float)
+    return 0.5 * (y_hi + y_lo) + a * erf_vals
+
+
+def build_erf_fit_and_derivative(n, dt_s, x0_idx, w_idx, y_lo, y_hi):
+    """
+    Build:
+      fit_y[i] = fitted erf curve
+      fit_d[i] = derivative of fitted erf w.r.t. time
+    Mirrors the STM32 logic:
+      d/dx erf((x-x0)/w) = (2/sqrt(pi)) * exp(-z^2) / w
+      dx/dt = 1/dt_s
+    """
+    x = np.arange(n, dtype=float)
+    w_idx = max(float(w_idx), 1e-9)
+
+    a = 0.5 * (y_hi - y_lo)
+    z = (x - float(x0_idx)) / w_idx
+
+    fit_y = erf_model_idx(x, x0_idx, w_idx, y_lo, y_hi)
+    fit_d = a * (2.0 / math.sqrt(math.pi)) * np.exp(-(z * z)) / (w_idx * dt_s)
+
+    return fit_y, fit_d
+
+
+def estimate_erf_initial_params(y):
+    """
+    Initial guess for erf fit parameters.
+    """
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    x = np.arange(n, dtype=float)
+
+    k = max(3, n // 10)
+    y_lo = float(np.median(y[:k]))
+    y_hi = float(np.median(y[-k:]))
+
+    y_mid = 0.5 * (y_lo + y_hi)
+    x0_idx = float(x[np.argmin(np.abs(y - y_mid))])
+
+    dy = np.gradient(y)
+    peak = float(np.max(np.abs(dy))) if len(dy) else 0.0
+    amp = abs(y_hi - y_lo)
+
+    if peak > 1e-12:
+        # rough width estimate from local slope
+        # slope near center of erf is a*(2/sqrt(pi))/w
+        a = 0.5 * amp
+        if a > 1e-12:
+            w_idx = max((a * (2.0 / math.sqrt(math.pi))) / peak, 2.0)
+        else:
+            w_idx = max(n / 20.0, 2.0)
+    else:
+        w_idx = max(n / 20.0, 2.0)
+
+    return x0_idx, w_idx, y_lo, y_hi
+
+
+def fit_erf_curve_simple(y, max_iters=80):
+    """
+    Lightweight erf fit without SciPy.
+    Coordinate-descent style refinement on:
+      x0_idx, w_idx, y_lo, y_hi
+
+    Returns fitted parameters in sample-index units.
+    """
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    x = np.arange(n, dtype=float)
+
+    x0, w, y_lo, y_hi = estimate_erf_initial_params(y)
+
+    def sse(params):
+        px0, pw, py_lo, py_hi = params
+        if pw < 1e-6:
+            return 1e30
+        yf = erf_model_idx(x, px0, pw, py_lo, py_hi)
+        e = y - yf
+        return float(np.dot(e, e))
+
+    params = [x0, w, y_lo, y_hi]
+    best = sse(params)
+
+    step_x0 = max(8.0, n * 0.03)
+    step_w = max(4.0, n * 0.02)
+    step_y = max(1e-6, 0.05 * max(abs(y_hi - y_lo), 1e-6))
+
+    for _ in range(max_iters):
+        improved = False
+
+        candidates = [
+            [params[0] + step_x0, params[1], params[2], params[3]],
+            [params[0] - step_x0, params[1], params[2], params[3]],
+            [params[0], params[1] + step_w, params[2], params[3]],
+            [params[0], max(2.0, params[1] - step_w), params[2], params[3]],
+            [params[0], params[1], params[2] + step_y, params[3]],
+            [params[0], params[1], params[2] - step_y, params[3]],
+            [params[0], params[1], params[2], params[3] + step_y],
+            [params[0], params[1], params[2], params[3] - step_y],
+        ]
+
+        for cand in candidates:
+            val = sse(cand)
+            if val < best:
+                params = cand
+                best = val
+                improved = True
+
+        if not improved:
+            step_x0 *= 0.5
+            step_w *= 0.5
+            step_y *= 0.5
+
+            if step_x0 < 0.05 and step_w < 0.05 and step_y < 1e-6:
+                break
+
+    return {
+        "x0_idx": float(params[0]),
+        "w_idx": max(float(params[1]), 2.0),
+        "y_lo": float(params[2]),
+        "y_hi": float(params[3]),
+        "sse": float(best),
+    }
+
+
+def erf_model_x(x, x0, w, y_lo, y_hi):
+    """
+    Error-function model versus physical position in mm.
+    """
+    x = np.asarray(x, dtype=float)
+    w = max(float(w), 1e-9)
+    a = 0.5 * (y_hi - y_lo)
+    z = (x - float(x0)) / w
+    erf_vals = np.array([math.erf(val) for val in z], dtype=float)
+    return 0.5 * (y_hi + y_lo) + a * erf_vals
+
+
+def estimate_erf_initial_params_x(x, y):
+    """
+    Initial guess for erf fit parameters on a physical x-axis.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if len(x) < 2:
+        return 0.0, 1.0, float(y[0]), float(y[-1])
+
+    k = max(3, len(y) // 10)
+    y_lo = float(np.median(y[:k]))
+    y_hi = float(np.median(y[-k:]))
+
+    y_mid = 0.5 * (y_lo + y_hi)
+    x0 = float(x[np.argmin(np.abs(y - y_mid))])
+
+    dy_dx = np.gradient(y, x)
+    peak = float(np.max(np.abs(dy_dx))) if len(dy_dx) else 0.0
+    amp = abs(y_hi - y_lo)
+    dx_med = float(np.median(np.diff(x)))
+    dx_min = max(abs(dx_med), 1e-6)
+
+    if peak > 1e-12:
+        a = 0.5 * amp
+        if a > 1e-12:
+            w = max((a * (2.0 / math.sqrt(math.pi))) / peak, 2.0 * dx_min)
+        else:
+            w = max(0.05 * abs(float(x[-1] - x[0])), 2.0 * dx_min)
+    else:
+        w = max(0.05 * abs(float(x[-1] - x[0])), 2.0 * dx_min)
+
+    return x0, w, y_lo, y_hi
+
+
+def fit_erf_curve_x_simple(x, y, max_iters=80):
+    """
+    Lightweight erf fit without SciPy on a physical x-axis.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    x0, w, y_lo, y_hi = estimate_erf_initial_params_x(x, y)
+
+    def sse(params):
+        px0, pw, py_lo, py_hi = params
+        if pw < 1e-6:
+            return 1e30
+        yf = erf_model_x(x, px0, pw, py_lo, py_hi)
+        e = y - yf
+        return float(np.dot(e, e))
+
+    params = [x0, w, y_lo, y_hi]
+    best = sse(params)
+
+    x_span = max(abs(float(x[-1] - x[0])), 1e-6)
+    dx_med = max(abs(float(np.median(np.diff(x)))), 1e-6)
+
+    step_x0 = max(4.0 * dx_med, 0.03 * x_span)
+    step_w = max(2.0 * dx_med, 0.02 * x_span)
+    step_y = max(1e-6, 0.05 * max(abs(y_hi - y_lo), 1e-6))
+
+    for _ in range(max_iters):
+        improved = False
+
+        candidates = [
+            [params[0] + step_x0, params[1], params[2], params[3]],
+            [params[0] - step_x0, params[1], params[2], params[3]],
+            [params[0], params[1] + step_w, params[2], params[3]],
+            [params[0], max(2.0 * dx_med, params[1] - step_w), params[2], params[3]],
+            [params[0], params[1], params[2] + step_y, params[3]],
+            [params[0], params[1], params[2] - step_y, params[3]],
+            [params[0], params[1], params[2], params[3] + step_y],
+            [params[0], params[1], params[2], params[3] - step_y],
+        ]
+
+        for cand in candidates:
+            val = sse(cand)
+            if val < best:
+                params = cand
+                best = val
+                improved = True
+
+        if not improved:
+            step_x0 *= 0.5
+            step_w *= 0.5
+            step_y *= 0.5
+
+            if step_x0 < 0.1 * dx_med and step_w < 0.1 * dx_med and step_y < 1e-6:
+                break
+
+    return {
+        "x0": float(params[0]),
+        "w": max(float(params[1]), 2.0 * dx_med),
+        "y_lo": float(params[2]),
+        "y_hi": float(params[3]),
+        "sse": float(best),
+    }
+
+
+def build_erf_fit_and_derivative_x(x, x0, w, y_lo, y_hi):
+    """
+    Build fitted erf curve and derivative with respect to x in mm.
+    """
+    x = np.asarray(x, dtype=float)
+    w = max(float(w), 1e-9)
+
+    a = 0.5 * (y_hi - y_lo)
+    z = (x - float(x0)) / w
+
+    fit_y = erf_model_x(x, x0, w, y_lo, y_hi)
+    fit_d = a * (2.0 / math.sqrt(math.pi)) * np.exp(-(z * z)) / w
+
+    return fit_y, fit_d
+
+
+def find_t0_index_from_initial_power(scan0, dt_s=None, return_debug=False):
+    """
+    New T0 pipeline:
+      1) use raw power samples from STM32
+      2) SG smooth
+      3) fit erf to SG-smoothed power
+      4) differentiate fitted erf
+      5) choose T0 from max absolute derivative
+
+    dt_s defaults to the raw ADC sample interval used by the STM32 stream.
+    """
+    p_raw = np.asarray(scan0["p_mw"], dtype=float)
+    n = len(p_raw)
+
+    if dt_s is None:
+        t_ms = np.asarray(scan0.get("t_ms", []), dtype=float)
+        if len(t_ms) >= 2:
+            dt_s = 1e-3 * float(np.median(np.diff(t_ms)))
+        else:
+            dt_s = RAW_SAMPLE_DT_S
+
+    if n < 7:
+        if return_debug:
+            return 0, {
+                "p_raw": p_raw.copy(),
+                "p_sg": p_raw.copy(),
+                "fit_y": p_raw.copy(),
+                "fit_d": np.zeros_like(p_raw),
+                "fit": None,
+            }
+        return 0
+
+    # 1-2) SG smoothing
+    p_sg = sg_smooth_5point(p_raw)
+
+    # 3) erf fit
+    fit = fit_erf_curve_simple(p_sg)
+
+    # 4) fitted erf + derivative of fitted erf
+    fit_y, fit_d = build_erf_fit_and_derivative(
+        n=n,
+        dt_s=dt_s,
+        x0_idx=fit["x0_idx"],
+        w_idx=fit["w_idx"],
+        y_lo=fit["y_lo"],
+        y_hi=fit["y_hi"],
+    )
+
+    # 5) choose T0 from derivative peak
+    t0_idx = int(np.argmax(np.abs(fit_d)))
+
+    if return_debug:
+        return t0_idx, {
+            "p_raw": p_raw,
+            "p_sg": p_sg,
+            "fit_y": fit_y,
+            "fit_d": fit_d,
+            "fit": fit,
+        }
+
+    return t0_idx
+
+
+def build_t0_info_from_initial_scan(scan0, t0_idx):
+    if scan0 is None:
+        return None
+    if t0_idx < 0 or t0_idx >= len(scan0["t_ms"]):
+        return None
+
+    deg0 = scan0["deg"][0]
+    deg_t0 = float(scan0["deg"][t0_idx] - deg0)
+    x0 = scan0["x_mm"][0]
+    x_t0 = float(scan0["x_mm"][t0_idx] - x0)
+
+    return {
+        "idx": int(t0_idx),
+        "t_ms": float(scan0["t_ms"][t0_idx]),
+        "deg": deg_t0,
+        "x_mm": x_t0,
+        "raw": int(scan0["raw"][t0_idx]),
+        "stage": int(scan0["stage"][t0_idx]),
+        "v": float(scan0["v"][t0_idx]),
+        "p_mw": float(scan0["p_mw"][t0_idx]),
+    }
+
+
+def compute_first_repeat_start_counts(scan0, t0_idx):
+    if scan0 is None:
+        return PROFILE_WAIT_COUNTS + (PROFILE_REPEAT_COUNTS // 2)
+
+    enc = np.asarray(scan0["enc"], dtype=int)
+    if len(enc) < 2 or t0_idx < 0 or t0_idx >= len(enc):
+        return PROFILE_WAIT_COUNTS + (PROFILE_REPEAT_COUNTS // 2)
+
+    enc_start = int(enc[0])
+    enc_end = int(enc[-1])
+    t0_enc = int(enc[t0_idx])
+
+    dir_sign = 1 if encoder_delta_counts(enc_end, enc_start) >= 0 else -1
+
+    x0_counts = dir_sign * encoder_delta_counts(t0_enc, enc_start)
+    x0_counts = max(0, int(x0_counts))
+
+    init_counts_measured = abs(encoder_delta_counts(enc_end, enc_start))
+
+    # --- nominal first target ---
+    xs1 = PROFILE_WAIT_COUNTS + (PROFILE_REPEAT_COUNTS // 2) + x0_counts
+
+    period = PROFILE_EVENT_COUNTS
+
+    # --- ensure after initial scan ---
+    while xs1 < init_counts_measured:
+        xs1 += period
+
+    # 🔥 NEW: emulate STM skip-ahead behavior
+    # Estimate how far encoder moved during T0 compute
+    # (use end-to-start delta as proxy)
+    arm_delay = init_counts_measured * 0.25   # heuristic
+
+    simulated_now = init_counts_measured + arm_delay
+
+    while xs1 <= simulated_now:
+        xs1 += period
+
+    return int(xs1)
+
+
+def build_axis_scan_count_log(axis, scan0, t0_idx, first_repeat_start_counts, repeated_scans):
+    axis_label = axis + 1
+    lines = [f"[Axis {axis_label}]"]
+
+    lines.append(f"initial_target_counts={PROFILE_INIT_COUNTS}")
+    lines.append(f"repeat_target_counts={PROFILE_REPEAT_COUNTS}")
+    lines.append(f"repeat_half_counts={PROFILE_REPEAT_COUNTS // 2}")
+    lines.append(f"t90_counts={PROFILE_EVENT_COUNTS}")
+    lines.append(f"twait_counts={PROFILE_WAIT_COUNTS}")
+    lines.append(f"first_repeat_start_counts={first_repeat_start_counts}")
+
+    if scan0 is None or len(scan0["enc"]) < 2:
+        lines.append("initial_measured_counts=unavailable")
+        return "\n".join(lines)
+
+    init_enc = np.asarray(scan0["enc"], dtype=int)
+    init_start = int(init_enc[0])
+    init_end = int(init_enc[-1])
+    init_span_signed = encoder_delta_counts(init_end, init_start)
+    dir_sign = 1 if init_span_signed >= 0 else -1
+    init_span = abs(init_span_signed)
+    lines.append(f"initial_measured_counts={init_span}")
+
+    if 0 <= t0_idx < len(init_enc):
+        t0_enc = int(init_enc[t0_idx])
+        x0_counts = max(0, dir_sign * encoder_delta_counts(t0_enc, init_start))
+        counts_after_t0 = max(0, dir_sign * encoder_delta_counts(init_end, t0_enc))
+        first_wait_counts = max(0, first_repeat_start_counts - init_span)
+        lines.append(f"t0_counts_from_initial_start={x0_counts}")
+        lines.append(f"counts_after_t0_to_initial_end={counts_after_t0}")
+        lines.append(
+            "first_repeat_start_formula="
+            f"{PROFILE_WAIT_COUNTS}+{PROFILE_REPEAT_COUNTS // 2}+{x0_counts}"
+            f"={first_repeat_start_counts}"
+        )
+        lines.append(f"first_wait_counts={first_wait_counts}")
+        lines.append(
+            "first_wait_formula="
+            f"{first_repeat_start_counts}-{init_span}"
+            f"={first_wait_counts}"
+        )
+    else:
+        t0_enc = None
+        lines.append("t0_counts_from_initial_start=unavailable")
+        lines.append("counts_after_t0_to_initial_end=unavailable")
+
+    if repeated_scans:
+        first_repeat_enc = np.asarray(repeated_scans[0]["enc"], dtype=int)
+        if len(first_repeat_enc) >= 1:
+            first_start_from_init_start = encoder_step_distance(int(first_repeat_enc[0]), init_start)
+            first_gap = encoder_step_distance(int(first_repeat_enc[0]), init_end)
+            lines.append(f"first_repeat_start_measured_counts={first_start_from_init_start}")
+            lines.append(f"first_wait_measured_counts={first_gap}")
+
+    prev_start = None
+    prev_end = init_end
+    for scan in repeated_scans:
+        scan_no = int(scan["scan_no"])
+        enc = np.asarray(scan["enc"], dtype=int)
+        if len(enc) < 2:
+            lines.append(f"repeat_{scan_no:02d}_measured_counts=unavailable")
+            continue
+
+        start = int(enc[0])
+        end = int(enc[-1])
+        span = encoder_step_distance(end, start)
+        wait_from_prev_end = encoder_step_distance(start, prev_end)
+
+        lines.append(f"repeat_{scan_no:02d}_measured_counts={span}")
+        lines.append(f"repeat_{scan_no:02d}_wait_from_prev_end_counts={wait_from_prev_end}")
+
+        if prev_start is not None:
+            start_to_start = encoder_step_distance(start, prev_start)
+            lines.append(f"repeat_{scan_no:02d}_start_to_start_counts={start_to_start}")
+
+        prev_start = start
+        prev_end = end
+
+    return "\n".join(lines)
+
+
+def save_scan_count_log(run_dir, axis_logs):
+    out_path = os.path.join(run_dir, "scan_count_log.txt")
+    text = "\n\n".join(axis_logs)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    return out_path
+
+# ============================================================
+# T0 scan processing
+# ============================================================
+def process_initial_t0_scan_for_width(scan0, t0_idx=None, t0_info=None):
+    """
+    Estimate beam width directly from the initial T0 scan,
+    but force alignment to the already-found T0 from scan0.
+
+    Method:
+      1) sort by x_mm
+      2) SG smooth the power
+      3) fit an erf in physical x
+      4) take absolute derivative of fitted erf as beam profile
+      5) align x to the previously found T0 position
+      6) compute sigma and 4sigma from that inferred profile
+    """
+    if scan0 is None:
+        return None
+
+    raw = np.asarray(scan0["raw"], dtype=float)
+    x_mm = np.asarray(scan0["x_mm"], dtype=float)
+    p_mw = np.asarray(scan0["p_mw"], dtype=float)
+
+    if len(raw) < 10 or len(x_mm) < 10 or len(p_mw) < 10:
+        return None
+
+    # Get the trusted T0 position from the already-found initial-scan result
+    if t0_info is not None and "x_mm" in t0_info:
+        x_t0_ref = float(t0_info["x_mm"])
+    elif t0_idx is not None and 0 <= int(t0_idx) < len(x_mm):
+        x0_start = float(x_mm[0])
+        x_t0_ref = float(x_mm[int(t0_idx)] - x0_start)
+    else:
+        return None
+
+    # Sort the scan by physical position
+    order = np.argsort(x_mm)
+    x_mm = x_mm[order]
+    p_mw = p_mw[order]
+
+    # Average duplicate positions
+    x_mm, averaged = average_duplicate_positions(x_mm, p_mw)
+    p_mw = averaged[0]
+
+    if len(x_mm) < 5:
+        return None
+
+    # Smooth power before fitting
+    p_sg = sg_smooth_5point(p_mw)
+
+    # Fit an erf in physical x only to get a smooth derivative/profile shape
+    fit = fit_erf_curve_x_simple(x_mm, p_sg)
+
+    fit_y, fit_d = build_erf_fit_and_derivative_x(
+        x_mm,
+        fit["x0"],
+        fit["w"],
+        fit["y_lo"],
+        fit["y_hi"],
+    )
+
+    # Beam profile inferred from derivative of fitted knife-edge
+    profile_full = np.abs(fit_d)
+
+    # IMPORTANT: align to the already-found T0, not the fit center
+    x_mm_rel = x_mm - x_t0_ref
+
+    # Crop around main lobe for cleaner width stats
+    x_prof, profile = crop_main_lobe(x_mm_rel, profile_full)
+
+    mu, sigma, width_4sigma = weighted_stats_from_profile(x_prof, profile)
+
+    # Keep normalized knife-edge for plotting/inspection
+    P = knife_from_monotonic_power(fit_y)
+
+    return {
+        "x_mm": x_mm_rel,
+        "p_mw": fit_y,
+        "P": P,
+        "P_plot": scale_normalized_to_power(P, fit_y),
+        "profile_full": profile_full,
+        "x_prof": x_prof,
+        "profile": profile,
+        "x_t0": x_t0_ref,          # trusted T0 from initial scan
+        "x_fit_center": float(fit["x0"]),  # optional debug: model center
+        "mu": mu,
+        "sigma": sigma,
+        "width_4sigma": width_4sigma,
+        "mode": "initial_t0_scan",
+        "fit": fit,
+        "p_raw_sorted": p_mw,
+        "p_sg": p_sg,
+    }
+
+
+# ============================================================
+# Repeated scan processing
+# ============================================================
+def process_repeated_scan(scan):
+    raw = np.asarray(scan["raw"], dtype=float)
+    enc = np.asarray(scan["enc"], dtype=float)
+    deg = np.asarray(scan["deg"], dtype=float)
+    v = np.asarray(scan["v"], dtype=float)
+    p_mw = np.asarray(scan["p_mw"], dtype=float)
+
+    if len(raw) < 10:
+        return None
+
+    x_mm = np.asarray(scan["x_mm"], dtype=float)
+
+    order = np.argsort(x_mm)
+    x_mm = x_mm[order]
+    raw = raw[order]
+    enc = enc[order]
+    deg = deg[order]
+    v = v[order]
+    p_mw = p_mw[order]
+
+    x_mm, averaged = average_duplicate_positions(x_mm, raw, enc, deg, v, p_mw)
+    raw, enc, deg, v, p_mw = averaged
+
+    if len(x_mm) < 5:
+        return None
+
+    # Repeated scans use the same SG pre-smoothing as the initial T0 fit.
+    # For monotonic knife-edge traces, we then fit an erf and differentiate
+    # the fitted curve so the beam profile comes from a smoothed physical model.
+    p_sg = sg_smooth_5point(p_mw)
+    mono_diag = monotonic_diagnostics(p_sg)
+    strong_edge_span = mono_diag["edge_span_ratio"] >= EDGE_SPAN_RATIO_THRESH
+    monotonic_mode = True if scan.get("synthetic", False) else (strong_edge_span or is_mostly_monotonic(p_sg))
+
+    if monotonic_mode:
+        fit = fit_erf_curve_x_simple(x_mm, p_sg)
+        fit_y, fit_d = build_erf_fit_and_derivative_x(
+            x_mm,
+            fit["x0"],
+            fit["w"],
+            fit["y_lo"],
+            fit["y_hi"],
+        )
+
+        P = knife_from_monotonic_power(fit_y)
+        dPdx = np.gradient(P, x_mm)
+        x_t0 = float(fit["x0"])
+
+        profile_full = np.abs(fit_d)
+        p_used = fit_y
+    else:
+        p_used = moving_average(p_sg, MA_W_P)
+        P, profile_full = profile_from_hump_power(x_mm, p_used)
+
+        # local T0 from integrated-profile knife-edge midpoint
+        # more stable than centroid for alignment
+        x_t0 = crossing_x_at_level(x_mm, P, 0.5)
+        dPdx = np.gradient(P, x_mm)
+
+    # Align everything to local T0, not centroid
+    x_mm_rel = x_mm - x_t0
+
+    if monotonic_mode:
+        x_prof = x_mm_rel
+        profile = profile_full
+    else:
+        if np.max(profile_full) > 0:
+            profile_full = np.where(profile_full >= 0.04 * np.max(profile_full), profile_full, 0.0)
+        x_prof, profile = crop_main_lobe(x_mm_rel, profile_full)
+
+    mu, sigma, width_4sigma = weighted_stats_from_profile(x_prof, profile)
+
+    return {
+        "x_mm": x_mm_rel,
+        "deg": deg,
+        "enc": enc,
+        "raw": raw,
+        "v": v,
+        "p_mw": p_used,
+        "P": P,
+        "P_plot": scale_normalized_to_power(P, p_used),
+        "dPdx": dPdx,
+        "profile_full": profile_full,
+        "x_prof": x_prof,
+        "profile": profile,
+        "mu": mu,
+        "sigma": sigma,
+        "width_4sigma": width_4sigma,
+        "x_center": 0.0,
+        "x_t0": x_t0,
+        "mode": "knife_edge" if monotonic_mode else "profile_integrated",
+        "mono_score": mono_diag["mono_score"],
+        "interior_peak": mono_diag["interior_peak"],
+        "interior_valley": mono_diag["interior_valley"],
+        "edge_left_level": mono_diag["left_level"],
+        "edge_right_level": mono_diag["right_level"],
+        "end_to_end": mono_diag["end_to_end"],
+        "total_var": mono_diag["total_var"],
+        "edge_span_ratio": mono_diag["edge_span_ratio"],
+        "forced_synthetic_monotonic": bool(scan.get("synthetic", False)),
+    }
+
+def average_processed_scans(results):
+    if not results:
+        return None
+    if len(results) == 1:
+        return results[0]
+
+    x0 = max(r["x_mm"][0] for r in results)
+    x1 = min(r["x_mm"][-1] for r in results)
+    if x1 <= x0:
+        return None
+
+    n = min(len(r["x_mm"]) for r in results)
+    x_common = np.linspace(x0, x1, n)
+
+    p_stack = []
+    P_stack = []
+    d_stack = []
+    prof_stack = []
+
+    for r in results:
+        p_stack.append(np.interp(x_common, r["x_mm"], r["p_mw"]))
+        P_stack.append(np.interp(x_common, r["x_mm"], r["P"]))
+        d_stack.append(np.interp(x_common, r["x_mm"], r["dPdx"]))
+        prof_stack.append(np.interp(x_common, r["x_mm"], r["profile_full"]))
+
+    p_avg = np.mean(np.vstack(p_stack), axis=0)
+    P_avg = np.mean(np.vstack(P_stack), axis=0)
+    d_avg = np.mean(np.vstack(d_stack), axis=0)
+    prof_full_avg = np.mean(np.vstack(prof_stack), axis=0)
+
+    all_knife_edge = all(r.get("mode") == "knife_edge" for r in results)
+
+    if all_knife_edge:
+        x_prof = x_common
+        prof_avg = prof_full_avg
+        mode = "knife_edge_avg"
+    else:
+        if np.max(prof_full_avg) > 0:
+            prof_full_avg = np.where(prof_full_avg >= 0.04 * np.max(prof_full_avg), prof_full_avg, 0.0)
+        x_prof, prof_avg = crop_main_lobe(x_common, prof_full_avg)
+        mode = "avg"
+
+    mu, sigma, width_4sigma = weighted_stats_from_profile(x_prof, prof_avg)
+
+    return {
+        "x_mm": x_common,
+        "deg": None,
+        "p_mw": p_avg,
+        "P": P_avg,
+        "P_plot": scale_normalized_to_power(P_avg, p_avg),
+        "dPdx": d_avg,
+        "profile_full": prof_full_avg,
+        "x_prof": x_prof,
+        "profile": prof_avg,
+        "mu": mu,
+        "sigma": sigma,
+        "width_4sigma": width_4sigma,
+        "x_center": 0.0,
+        "x_t0": 0.0,
+        "mode": mode,
+    }
+
+
+# ============================================================
+# Save / plot helpers
+# ============================================================
+def save_initial_raw_csv(scan, out_csv, first_repeat_start_counts=None, t0_idx=None):
+    data = np.column_stack((
+        np.arange(len(scan["raw"]), dtype=int),
+        scan["t_ms"],
+        scan["deg"],
+        scan["x_mm"],
+        scan["enc"],
+        scan["stage"],
+        scan["raw"],
+        scan["v"],
+        scan["p_mw"],
+    ))
+
+    # --- Build header with metadata ---
+    header_lines = []
+
+    if first_repeat_start_counts is not None:
+        header_lines.append(f"# first_repeat_start_counts={first_repeat_start_counts}")
+
+    if t0_idx is not None:
+        header_lines.append(f"# t0_idx={t0_idx}")
+
+    header_lines.append("point_idx,t_ms,deg,x_mm,enc,stage,raw,v,p_mw")
+
+    header = "\n".join(header_lines)
+
+    np.savetxt(
+        out_csv,
+        data,
+        delimiter=",",
+        header=header,
+        comments="",   # keep '#' manually
+        fmt=["%d", "%.6f", "%.6f", "%.6f", "%d", "%d", "%d", "%.6f", "%.6f"]
+    )
+
+def save_initial_t0_width_csv(axis, result, out_csv):
+    n1 = len(result["x_mm"])
+    n2 = len(result["x_prof"])
+
+    with open(out_csv, "w", encoding="utf-8") as f:
+        f.write(f"# axis,{axis}\n")
+        f.write(f"# mode,{result['mode']}\n")
+        f.write(f"# x_t0_mm,{result['x_t0']}\n")
+        f.write(f"# sigma_mm,{result['sigma']}\n")
+        f.write(f"# width_4sigma_mm,{result['width_4sigma']}\n")
+        f.write(f"# mu_mm,{result['mu']}\n")
+        f.write("x_mm,p_mw,P,profile_x_mm,beam_profile\n")
+
+        for i in range(max(n1, n2)):
+            c1 = c2 = c3 = c4 = c5 = ""
+            if i < n1:
+                c1 = f"{result['x_mm'][i]:.6f}"
+                c2 = f"{result['p_mw'][i]:.6f}"
+                c3 = f"{result['P'][i]:.6f}"
+            if i < n2:
+                c4 = f"{result['x_prof'][i]:.6f}"
+                c5 = f"{result['profile'][i]:.6f}"
+            f.write(f"{c1},{c2},{c3},{c4},{c5}\n")
+
+def save_initial_t0_width_plots(axis, result, out_dir):
+    axis_label = axis + 1
+
+    fig1, ax1 = plt.subplots(figsize=(10, 5))
+    ax1.plot(result["x_mm"], result["p_mw"], label="Fitted knife-edge power (mW)")
+    ax1.axvline(0.0, linestyle="--", linewidth=2, label="T0 = 0.000 mm")
+    ax1.set_xlabel("Position x relative to T0 (mm)")
+    ax1.set_ylabel("Power (mW)")
+    ax1.set_title(f"Axis {axis_label} Initial T0 Scan - Fitted Knife Edge")
+    ax1.grid(True)
+    ax1.legend()
+    if result["sigma"] is not None:
+        ax1.text(
+            0.02, 0.98,
+            f"σ = {result['sigma']:.3f} mm\n4σ = {result['width_4sigma']:.3f} mm",
+            transform=ax1.transAxes,
+            va="top", ha="left"
+        )
+    fig1.savefig(
+        os.path.join(out_dir, f"axis{axis_label}_initial_t0_width_knifeedge.png"),
+        dpi=200,
+        bbox_inches="tight"
+    )
+    plt.close(fig1)
+
+    fig2, ax2 = plt.subplots(figsize=(10, 5))
+    ax2.plot(result["x_prof"], result["profile"], label="Beam profile from fitted derivative")
+    ax2.set_xlabel("Position x relative to T0 (mm)")
+    ax2.set_ylabel("Profile amplitude")
+    ax2.set_title(f"Axis {axis_label} Initial T0 Scan - Beam Profile")
+    ax2.grid(True)
+    ax2.legend()
+    if result["sigma"] is not None:
+        ax2.text(
+            0.02, 0.98,
+            f"σ = {result['sigma']:.3f} mm\n4σ = {result['width_4sigma']:.3f} mm",
+            transform=ax2.transAxes,
+            va="top", ha="left"
+        )
+    fig2.savefig(
+        os.path.join(out_dir, f"axis{axis_label}_initial_t0_width_profile.png"),
+        dpi=200,
+        bbox_inches="tight"
+    )
+    plt.close(fig2)
+
+def save_repeated_raw_csv(scan, out_csv):
+    data = np.column_stack((
+        np.arange(len(scan["raw"]), dtype=int),
+        scan["t_ms"],
+        scan["deg"],
+        scan["x_mm"],
+        scan["enc"],
+        scan["stage"],
+        scan["raw"],
+        scan["v"],
+        scan["p_mw"],
+    ))
+    np.savetxt(
+        out_csv,
+        data,
+        delimiter=",",
+        header="point_idx,t_ms,deg,x_mm,enc,stage,raw,v,p_mw",
+        comments="",
+        fmt=["%d", "%.6f", "%.6f", "%.6f", "%d", "%d", "%d", "%.6f", "%.6f"]
+    )
+
+
+def save_processed_scan_csv(axis, scan_no, result, out_csv):
+    n1 = len(result["x_mm"])
+    n2 = len(result["x_prof"])
+    with open(out_csv, "w", encoding="utf-8") as f:
+        f.write(f"# axis,{axis}\n")
+        f.write(f"# scan_no,{scan_no}\n")
+        f.write(f"# mode,{result['mode']}\n")
+        f.write(f"# x_t0_mm,{result.get('x_t0', 0.0)}\n")
+        f.write(f"# sigma_mm,{result['sigma']}\n")
+        f.write(f"# width_4sigma_mm,{result['width_4sigma']}\n")
+        f.write("x_mm,p_mw,P,profile_x_mm,beam_profile\n")
+        for i in range(max(n1, n2)):
+            c1 = c2 = c3 = c4 = c5 = ""
+            if i < n1:
+                c1 = f"{result['x_mm'][i]:.6f}"
+                c2 = f"{result['p_mw'][i]:.6f}"
+                c3 = f"{result['P'][i]:.6f}"
+            if i < n2:
+                c4 = f"{result['x_prof'][i]:.6f}"
+                c5 = f"{result['profile'][i]:.6f}"
+            f.write(f"{c1},{c2},{c3},{c4},{c5}\n")
+
+
+def save_initial_t0_plots(axis, scan0, t0_info, out_dir, t0_dbg=None):
+    axis_label = axis + 1
+
+    x_deg = np.asarray(scan0["deg"], dtype=float)
+    p_plot = np.asarray(scan0["p_mw"], dtype=float)
+    power_label = "Power (mW)"
+
+    if t0_dbg is not None and "p_sg" in t0_dbg:
+        p_plot = np.asarray(t0_dbg["p_sg"], dtype=float)
+        power_label = "Filtered power (mW)"
+
+    fig_power, ax_power = plt.subplots(figsize=(11, 6))
+    ax_power.plot(x_deg, p_plot, label=power_label)
+
+    if t0_info is not None:
+        ax_power.axvline(
+            t0_info["deg"],
+            linestyle="--",
+            linewidth=2,
+            label=f"T0 = {t0_info['deg']:.3f} deg"
+        )
+
+    ax_power.set_xlabel("Angle (deg)")
+    ax_power.set_ylabel("Power (mW)")
+    ax_power.set_title(f"Axis {axis_label} Initial Scan 0 - Power / T0")
+    ax_power.grid(True)
+    if ax_power.lines:
+        ax_power.legend()
+
+    fig_power.tight_layout()
+    fig_power.savefig(
+        os.path.join(out_dir, f"axis{axis_label}_initial_scan0_t0.png"),
+        dpi=200,
+        bbox_inches="tight"
+    )
+    plt.close(fig_power)
+
+    if t0_dbg is not None:
+        fit_d = np.abs(np.asarray(t0_dbg["fit_d"], dtype=float))
+        if np.max(fit_d) > 0:
+            fit_d_plot = fit_d / np.max(fit_d)
+        else:
+            fit_d_plot = fit_d.copy()
+
+        fig_deriv, ax_deriv = plt.subplots(figsize=(11, 6))
+        ax_deriv.plot(x_deg, fit_d_plot, label="Normalized |d/dt fitted erf|")
+
+        if t0_info is not None:
+            ax_deriv.axvline(
+                t0_info["deg"],
+                linestyle="--",
+                linewidth=2,
+                label=f"T0 = {t0_info['deg']:.3f} deg"
+            )
+
+        ax_deriv.set_xlabel("Angle (deg)")
+        ax_deriv.set_ylabel("Normalized derivative")
+        ax_deriv.set_title(f"Axis {axis_label} Initial Scan 0 - Fitted Derivative")
+        ax_deriv.grid(True)
+        if ax_deriv.lines:
+            ax_deriv.legend()
+
+        fig_deriv.tight_layout()
+        fig_deriv.savefig(
+            os.path.join(out_dir, f"axis{axis_label}_initial_scan0_t0_derivative.png"),
+            dpi=200,
+            bbox_inches="tight"
+        )
+        plt.close(fig_deriv)
+
+
+def save_individual_scan_plots(axis, scan_no, result, out_dir, t0_info=None):
+    axis_label = axis + 1
+
+    fig1, ax1 = plt.subplots(figsize=(10, 5))
+    ax1.plot(result["x_mm"], result["p_mw"], label="Power (mW)")
+    if t0_info is not None:
+        ax1.axvline(0.0, linestyle="--", linewidth=2, label="T0 = 0.000 mm")
+    ax1.set_xlabel("Position x (mm)")
+    ax1.set_ylabel("Power (mW)")
+    ax1.set_title(f"Axis {axis_label} Scan {scan_no} - Power")
+    ax1.grid(True)
+    ax1.legend()
+    if result["sigma"] is not None:
+        ax1.text(
+            0.02, 0.98,
+            f"σ = {result['sigma']:.3f} mm\n4σ = {result['width_4sigma']:.3f} mm\nmode = {result['mode']}",
+            transform=ax1.transAxes,
+            va="top", ha="left"
+        )
+    fig1.savefig(os.path.join(out_dir, f"axis{axis_label}_scan{scan_no}_knifeedge.png"), dpi=200, bbox_inches="tight")
+    if POPUP_EACH_SCAN:
+        plt.show(block=False)
+    plt.close(fig1)
+
+    fig2, ax2 = plt.subplots(figsize=(10, 5))
+    ax2.plot(result["x_prof"], result["profile"], label="Beam profile")
+    ax2.set_xlabel("Position relative to centroid (mm)")
+    ax2.set_ylabel("Profile amplitude")
+    ax2.set_title(f"Axis {axis_label} Scan {scan_no} - Beam Profile")
+    ax2.grid(True)
+    ax2.legend()
+    if result["sigma"] is not None:
+        ax2.text(
+            0.02, 0.98,
+            f"σ = {result['sigma']:.3f} mm\n4σ = {result['width_4sigma']:.3f} mm",
+            transform=ax2.transAxes,
+            va="top", ha="left"
+        )
+    fig2.savefig(os.path.join(out_dir, f"axis{axis_label}_scan{scan_no}_profile.png"), dpi=200, bbox_inches="tight")
+    if POPUP_EACH_SCAN:
+        plt.show(block=False)
+    plt.close(fig2)
+
+
+def save_average_csv(axis, avg_result, out_csv):
+    n1 = len(avg_result["x_mm"])
+    n2 = len(avg_result["x_prof"])
+    with open(out_csv, "w", encoding="utf-8") as f:
+        f.write(f"# axis,{axis}\n")
+        f.write(f"# mode,{avg_result['mode']}\n")
+        f.write(f"# sigma_mm,{avg_result['sigma']}\n")
+        f.write(f"# width_4sigma_mm,{avg_result['width_4sigma']}\n")
+        f.write(f"# mu_mm,{avg_result['mu']}\n")
+        f.write("x_mm,p_mw,P,profile_x_mm,beam_profile\n")
+        for i in range(max(n1, n2)):
+            c1 = c2 = c3 = c4 = c5 = ""
+            if i < n1:
+                c1 = f"{avg_result['x_mm'][i]:.6f}"
+                c2 = f"{avg_result['p_mw'][i]:.6f}"
+                c3 = f"{avg_result['P'][i]:.6f}"
+            if i < n2:
+                c4 = f"{avg_result['x_prof'][i]:.6f}"
+                c5 = f"{avg_result['profile'][i]:.6f}"
+            f.write(f"{c1},{c2},{c3},{c4},{c5}\n")
+
+
+def save_average_plots(axis, avg_result, out_dir, t0_info=None):
+    axis_label = axis + 1
+
+    fig1, ax1 = plt.subplots(figsize=(10, 5))
+    ax1.plot(avg_result["x_mm"], avg_result["p_mw"], label="Average power (mW)")
+    if t0_info is not None:
+        ax1.axvline(0.0, linestyle="--", linewidth=2, label="T0 = 0.000 mm")
+    ax1.set_xlabel("Position x (mm)")
+    ax1.set_ylabel("Power (mW)")
+    ax1.set_title(f"Axis {axis_label} Average - Power")
+    ax1.grid(True)
+    ax1.legend()
+    if avg_result["sigma"] is not None:
+        ax1.text(
+            0.02, 0.98,
+            f"σ = {avg_result['sigma']:.3f} mm\n4σ = {avg_result['width_4sigma']:.3f} mm\nmode = {avg_result['mode']}",
+            transform=ax1.transAxes,
+            va="top", ha="left"
+        )
+    fig1.savefig(os.path.join(out_dir, f"axis{axis_label}_average_knifeedge.png"), dpi=200, bbox_inches="tight")
+    plt.close(fig1)
+
+    fig2, ax2 = plt.subplots(figsize=(10, 5))
+    ax2.plot(avg_result["x_prof"], avg_result["profile"], label="Average beam profile")
+    ax2.set_xlabel("Position relative to centroid (mm)")
+    ax2.set_ylabel("Profile amplitude")
+    ax2.set_title(f"Axis {axis_label} Average - Beam Profile")
+    ax2.grid(True)
+    ax2.legend()
+    if avg_result["sigma"] is not None:
+        ax2.text(
+            0.02, 0.98,
+            f"σ = {avg_result['sigma']:.3f} mm\n4σ = {avg_result['width_4sigma']:.3f} mm",
+            transform=ax2.transAxes,
+            va="top", ha="left"
+        )
+    fig2.savefig(os.path.join(out_dir, f"axis{axis_label}_average_profile.png"), dpi=200, bbox_inches="tight")
+    plt.close(fig2)
+
+
+def popup_average_plots(axis, avg_result, t0_info=None):
+    axis_label = axis + 1
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(avg_result["x_mm"], avg_result["p_mw"], label="Average power (mW)")
+    if t0_info is not None:
+        plt.axvline(0.0, linestyle="--", linewidth=2, label="T0 = 0.000 mm")
+    plt.xlabel("Position x (mm)")
+    plt.ylabel("Power (mW)")
+    plt.title(f"Axis {axis_label} Average - Power")
+    plt.grid(True)
+    plt.legend()
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(avg_result["x_prof"], avg_result["profile"], label="Average beam profile")
+    plt.xlabel("Position relative to centroid (mm)")
+    plt.ylabel("Profile amplitude")
+    plt.title(f"Axis {axis_label} Average - Beam Profile")
+    plt.grid(True)
+    plt.legend()
+
+
+# ============================================================
+# Raw scan collector
+# ============================================================
+class RawScanCollector:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.axis = None
+        self.scan_no = None
+        self.idx = []
+        self.enc = []
+        self.deg = []
+        self.x_mm = []
+        self.stage = []
+        self.raw = []
+        self.v = []
+        self.p_mw = []
+        self.t_ms = []
+        self.sample_dt_ms = 1000.0 * RAW_SAMPLE_DT_S
+        self.synthetic = False
+
+    def start(self, axis, scan_no, sample_dt_ms=None, synthetic=False):
+        self.reset()
+        self.axis = axis
+        self.scan_no = scan_no
+        if sample_dt_ms is not None:
+            self.sample_dt_ms = float(sample_dt_ms)
+        self.synthetic = bool(synthetic)
+
+    def add(self, idx, enc, deg, x_mm, stage, raw, v, p_mw):
+        self.idx.append(idx)
+        self.enc.append(enc)
+        self.deg.append(deg)
+        self.x_mm.append(x_mm)
+        self.stage.append(stage)
+        self.raw.append(raw)
+        self.v.append(v)
+        self.p_mw.append(p_mw)
+
+    def finalize(self):
+        if self.axis is None:
+            return None
+
+        idx = np.asarray(self.idx, dtype=int)
+
+        return {
+            "axis": int(self.axis),
+            "scan_no": int(self.scan_no),
+            "idx": idx,
+            "enc": np.asarray(self.enc, dtype=int),
+            "deg": np.asarray(self.deg, dtype=float),
+            "x_mm": np.asarray(self.x_mm, dtype=float),
+            "stage": np.asarray(self.stage, dtype=int),
+            "raw": np.asarray(self.raw, dtype=int),
+            "v": np.asarray(self.v, dtype=float),
+            "p_mw": np.asarray(self.p_mw, dtype=float),
+            "t_ms": self.sample_dt_ms * idx.astype(float),
+            "synthetic": self.synthetic,
+        }
+
+
+def build_replay_scan_paths(axis):
+    axis_label = axis + 1
+    axis_dir = os.path.join(REPLAY_RUN_ROOT, f"axis_{axis_label}")
+
+    csvs = [os.path.join(axis_dir, f"axis{axis_label}_scan0_raw.csv")]
+    for scan_no in range(1, NUM_REPEATED_SCANS + 1):
+        csvs.append(os.path.join(axis_dir, f"axis{axis_label}_scan{scan_no}_raw.csv"))
+
+    missing = [path for path in csvs if not os.path.exists(path)]
+    if missing:
+        raise FileNotFoundError(
+            f"Replay mode is missing saved scan CSVs for axis {axis_label}: {missing[0]}"
+        )
+
+    return csvs
+
+
+class ReplaySerial:
+    def __init__(self, timeout):
+        self.timeout = float(timeout)
+        self.proc = None
+        self.queue = queue.Queue()
+        self.reader_thread = None
+
+    def reset_input_buffer(self):
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def reset_output_buffer(self):
+        return
+
+    def _pump_stdout(self):
+        try:
+            for line in self.proc.stdout:
+                self.queue.put(line.encode("utf-8"))
+        finally:
+            self.queue.put(None)
+
+    def _launch_axis(self, axis):
+        self._stop_process()
+
+        cmd = [sys.executable, REPLAY_SCRIPT, *build_replay_scan_paths(axis), "--axis", str(axis), "--emit-status"]
+
+        if REPLAY_TIMING == "csv":
+            cmd.extend(["--timing", "csv", "--speedup", str(REPLAY_SPEEDUP)])
+        elif REPLAY_TIMING == "fixed":
+            cmd.extend(["--timing", "fixed", "--fixed-delay-ms", str(REPLAY_FIXED_DELAY_MS)])
+        else:
+            cmd.extend(["--timing", "none"])
+
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        self.reader_thread = threading.Thread(target=self._pump_stdout, daemon=True)
+        self.reader_thread.start()
+
+    def _stop_process(self):
+        if self.proc is not None:
+            if self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=1.0)
+            self.proc = None
+        self.reader_thread = None
+        self.reset_input_buffer()
+
+    def write(self, data):
+        if isinstance(data, bytes):
+            cmd = data.decode(errors="ignore").strip()
+        else:
+            cmd = str(data).strip()
+
+        if cmd.startswith("START_AXIS"):
+            axis = int(cmd[-1])
+            print(f"[replay] launching saved scan stream for axis {axis + 1}")
+            self._launch_axis(axis)
+        elif cmd.startswith("RUN_REPEAT"):
+            print("[replay] RUN_REPEAT ignored because replay stream already includes repeated scans")
+
+    def readline(self):
+        try:
+            item = self.queue.get(timeout=self.timeout)
+        except queue.Empty:
+            return b""
+
+        if item is None:
+            return b""
+        return item
+
+    def close(self):
+        self._stop_process()
+
+
+def open_scan_source():
+    if REPLAY_TEST_MODE:
+        ser = ReplaySerial(timeout=SERIAL_TIMEOUT_S)
+        print(f"Opened replay source from {REPLAY_RUN_ROOT}")
+        return ser
+
+    ser = serial.Serial(PORT, BAUD, timeout=SERIAL_TIMEOUT_S)
+    print(f"Opened {PORT} @ {BAUD}")
+    return ser
+
+
+# ============================================================
+# Serial helpers
+# ============================================================
+def should_echo_serial_line(line):
+    return not (
+        line.startswith("RAW_SCAN,")
+        or line.startswith("RAW_SCAN_BEGIN")
+        or line.startswith("RAW_SCAN_DONE")
+    )
+
+
+def read_axis_sequence(ser, axis, expected_repeats):
+    collector = RawScanCollector()
+    scans_by_no = {}
+    empty_count = 0
+    done_seen = False
+
+    while empty_count < REPEAT_EMPTY_LIMIT and not done_seen:
+        raw_line = ser.readline()
+        if not raw_line:
+            empty_count += 1
+            if empty_count % 10 == 0:
+                print(f"[waiting] axis={axis} no data yet ({empty_count} / {REPEAT_EMPTY_LIMIT})")
+            continue
+
+        empty_count = 0
+        line = raw_line.decode(errors="ignore").strip()
+        if not line:
+            continue
+
+        if should_echo_serial_line(line):
+            print(line)
+
+        if line.startswith("RAW_SCAN_BEGIN"):
+            parts = parse_keyvals_csv(line)
+            stride = float(parts.get("stride", "1"))
+            emit_stride = float(parts.get("emit_stride", "1"))
+            collector.start(
+                int(parts["axis"]),
+                int(parts["scan"]),
+                sample_dt_ms=(1000.0 * RAW_SAMPLE_DT_S * stride * emit_stride),
+                synthetic=(int(parts.get("synthetic", "0")) != 0),
+            )
+            continue
+
+        if line.startswith("RAW_SCAN,"):
+            parts = line.split(",")
+            if len(parts) == 11:
+                collector.add(
+                    idx=int(parts[3]),
+                    enc=int(parts[4]),
+                    deg=float(parts[5]),
+                    x_mm=float(parts[6]),
+                    stage=int(parts[7]),
+                    raw=int(parts[8]),
+                    v=float(parts[9]),
+                    p_mw=float(parts[10]),
+                )
+            continue
+
+        if line.startswith("RAW_SCAN_DONE"):
+            scan = collector.finalize()
+            if scan is not None and scan["axis"] == axis:
+                scans_by_no[scan["scan_no"]] = scan
+            continue
+
+        if line.startswith("AXIS_DONE_READY_FOR_NEXT") and axis == 0:
+            done_seen = True
+            continue
+
+        if line.startswith("PROFILE_DONE") and axis == 1:
+            done_seen = True
+            continue
+
+    if 0 not in scans_by_no:
+        got = sorted(scans_by_no.keys())
+        raise RuntimeError(
+            f"Axis {axis} completed but initial scan 0 was never received. "
+            f"Got scans: {got}"
+        )
+
+    repeated_scans = [scans_by_no[k] for k in sorted(scans_by_no.keys()) if k >= 1]
+    if len(repeated_scans) != expected_repeats:
+        print(
+            f"[warn] axis={axis} expected {expected_repeats} repeated scans, "
+            f"got {len(repeated_scans)}"
+        )
+
+    return scans_by_no[0], repeated_scans
+
+
+def read_until_initial_scan(ser, axis):
+    collector = RawScanCollector()
+    empty_count = 0
+
+    while empty_count < EMPTY_LIMIT:
+        raw_line = ser.readline()
+        if not raw_line:
+            empty_count += 1
+            if empty_count %10 == 0:
+                print(f"[waiting] axis={axis} no data yet ({empty_count} / {EMPTY_LIMIT})")
+            continue
+
+        empty_count = 0
+        line = raw_line.decode(errors="ignore").strip()
+        if not line:
+            continue
+
+        if should_echo_serial_line(line):
+            print(line)
+
+        if line.startswith("RAW_SCAN_BEGIN"):
+            parts = parse_keyvals_csv(line)
+            stride = float(parts.get("stride", "1"))
+            emit_stride = float(parts.get("emit_stride", "1"))
+            collector.start(
+                int(parts["axis"]),
+                int(parts["scan"]),
+                sample_dt_ms=(1000.0 * RAW_SAMPLE_DT_S * stride * emit_stride),
+                synthetic=(int(parts.get("synthetic", "0")) != 0),
+            )
+            continue
+
+        if line.startswith("RAW_SCAN,"):
+            parts = line.split(",")
+            # RAW_SCAN,axis,scan,idx,enc,deg,x_mm,stage,raw,v,p_mw
+            if len(parts) == 11:
+                collector.add(
+                    idx=int(parts[3]),
+                    enc=int(parts[4]),
+                    deg=float(parts[5]),
+                    x_mm=float(parts[6]),
+                    stage=int(parts[7]),
+                    raw=int(parts[8]),
+                    v=float(parts[9]),
+                    p_mw=float(parts[10]),
+                )
+            continue
+
+        if line.startswith("RAW_SCAN_DONE"):
+            scan = collector.finalize()
+            if scan is not None and scan["axis"] == axis and scan["scan_no"] == 0:
+                return scan
+
+        if line.startswith("INIT_SCAN_READY"):
+            continue
+
+    raise RuntimeError(f"Timeout waiting for initial scan on axis {axis}")
+
+
+def read_repeated_scans(ser, axis, expected_n):
+    collector = RawScanCollector()
+    scans = []
+    empty_count = 0
+
+    done_seen = False
+
+    while empty_count < REPEAT_EMPTY_LIMIT and not done_seen:
+        raw_line = ser.readline()
+        if not raw_line:
+            empty_count += 1
+            continue
+
+        empty_count = 0
+        line = raw_line.decode(errors="ignore").strip()
+        if not line:
+            continue
+
+        if should_echo_serial_line(line):
+            print(line)
+
+        if line.startswith("RAW_SCAN_BEGIN"):
+            parts = parse_keyvals_csv(line)
+            stride = float(parts.get("stride", "1"))
+            emit_stride = float(parts.get("emit_stride", "1"))
+            collector.start(
+                int(parts["axis"]),
+                int(parts["scan"]),
+                sample_dt_ms=(1000.0 * RAW_SAMPLE_DT_S * stride * emit_stride),
+                synthetic=(int(parts.get("synthetic", "0")) != 0),
+            )
+            continue
+
+        if line.startswith("RAW_SCAN,"):
+            parts = line.split(",")
+            # RAW_SCAN,axis,scan,idx,enc,deg,x_mm,stage,raw,v,p_mw
+            if len(parts) == 11:
+                collector.add(
+                    idx=int(parts[3]),
+                    enc=int(parts[4]),
+                    deg=float(parts[5]),
+                    x_mm=float(parts[6]),
+                    stage=int(parts[7]),
+                    raw=int(parts[8]),
+                    v=float(parts[9]),
+                    p_mw=float(parts[10]),
+                )
+            continue
+
+        if line.startswith("RAW_SCAN_DONE"):
+            scan = collector.finalize()
+            if scan is not None and scan["axis"] == axis and scan["scan_no"] >= 1:
+                scans.append(scan)
+            continue
+
+        if line.startswith("AXIS_DONE_READY_FOR_NEXT") and axis == 0:
+            done_seen = True
+            continue
+
+        if line.startswith("PROFILE_DONE") and axis == 1:
+            done_seen = True
+            continue
+
+    return scans
+
+
+# ============================================================
+# Main host-driven run
+# ============================================================
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_dir = os.path.join(SAVE_ROOT, f"profile_run_{timestamp}")
+ensure_dir(run_dir)
+
+ser = open_scan_source()
+ser.reset_input_buffer()
+ser.reset_output_buffer()
+
+all_initial_scans = {}
+all_t0_info = {}
+all_repeated_raw = {0: [], 1: []}
+all_repeated_processed = {0: [], 1: []}
+axis_count_logs = []
+
+try:
+    for axis in (0, 1):
+        axis_dir = os.path.join(run_dir, f"axis_{axis + 1}")
+        ensure_dir(axis_dir)
+
+        # --------------------------------------
+        # Start axis
+        # --------------------------------------
+        cmd = f"START_AXIS{axis}\n".encode()
+        print(f"TX: {cmd.decode().strip()}")
+        ser.write(cmd)
+
+        # --------------------------------------
+        # Full axis sequence dump (scan0 + repeats)
+        # --------------------------------------
+        scan0, repeated_scans = read_axis_sequence(ser, axis, NUM_REPEATED_SCANS)
+        # --- DEBUG: verify initial scan span ---
+        enc = np.asarray(scan0["enc"], dtype=float)
+
+        enc_start = enc[0]
+        enc_end = enc[-1]
+        enc_span = int(enc_end - enc_start)
+
+        print(f"\n[DEBUG] Axis {axis+1} INITIAL SCAN")
+        print(f"  Start enc = {enc_start}")
+        print(f"  End enc   = {enc_end}")
+        print(f"  Span      = {enc_span} counts (target = {PROFILE_INIT_COUNTS})")
+        print(f"  Samples   = {len(enc)}")
+        
+        if enc_span > 0:
+            print(f"  Samples per count ≈ {len(enc) / enc_span:.2f}")
+        all_initial_scans[axis] = scan0
+
+        # --------------------------------------
+        # T0 from initial scan
+        # --------------------------------------
+        t0_idx, t0_dbg = find_t0_index_from_initial_power(scan0, return_debug=True)
+        t0_info = build_t0_info_from_initial_scan(scan0, t0_idx)
+
+        print(
+            f"Axis {axis+1} T0 fit: "
+            f"x0_idx={t0_dbg['fit']['x0_idx']:.3f}, "
+            f"w_idx={t0_dbg['fit']['w_idx']:.3f}, "
+            f"y_lo={t0_dbg['fit']['y_lo']:.6f}, "
+            f"y_hi={t0_dbg['fit']['y_hi']:.6f}, "
+            f"t0_idx={t0_idx}"
+        )
+        all_t0_info[axis] = t0_info
+
+        first_repeat_start_counts = compute_first_repeat_start_counts(
+            scan0=scan0,
+            t0_idx=t0_idx
+        )
+
+        print(
+            f"Axis {axis+1} T0: idx={t0_idx}, "
+            f"first_repeat_start_counts={first_repeat_start_counts}"
+        )
+
+        save_initial_raw_csv(
+            scan0,
+            os.path.join(axis_dir, f"axis{axis+1}_scan0_raw.csv"),
+            first_repeat_start_counts=first_repeat_start_counts,
+            t0_idx=t0_idx
+        )
+
+        all_repeated_raw[axis] = repeated_scans
+
+        axis_count_logs.append(
+            build_axis_scan_count_log(
+                axis=axis,
+                scan0=scan0,
+                t0_idx=t0_idx,
+                first_repeat_start_counts=first_repeat_start_counts,
+                repeated_scans=repeated_scans
+            )
+        )
+
+        save_initial_t0_plots(axis, scan0, t0_info, axis_dir, t0_dbg=t0_dbg)
+        
+        initial_width_result = process_initial_t0_scan_for_width(
+            scan0,
+            t0_idx=t0_idx,
+            t0_info=t0_info,
+        )
+
+        if initial_width_result is not None:
+            print(
+                f"Axis {axis+1} initial T0 scan width: "
+                f"sigma={initial_width_result['sigma']:.4f} mm, "
+                f"4sigma={initial_width_result['width_4sigma']:.4f} mm"
+            )
+
+            save_initial_t0_width_csv(
+                axis,
+                initial_width_result,
+                os.path.join(axis_dir, f"axis{axis+1}_initial_t0_width.csv")
+            )
+
+            save_initial_t0_width_plots(
+                axis,
+                initial_width_result,
+                axis_dir
+            )
+        else:
+            print(f"Axis {axis+1} initial T0 scan width: unavailable")
+
+        for scan in repeated_scans:
+            scan_no = scan["scan_no"]
+
+            save_repeated_raw_csv(
+                scan,
+                os.path.join(axis_dir, f"axis{axis+1}_scan{scan_no}_raw.csv")
+            )
+
+            result = process_repeated_scan(scan)
+            if result is not None:
+                print(
+                    f"Axis {axis+1} Scan {scan_no}: "
+                    f"x_t0={result['x_t0']:.4f} mm, "
+                    f"sigma={result['sigma']:.4f} mm, "
+                    f"4sigma={result['width_4sigma']:.4f} mm, "
+                    f"mode={result['mode']}, "
+                    f"mono_score={result['mono_score']:.3f}, "
+                    f"edge_lo={result['edge_left_level']:.6f}, "
+                    f"edge_hi={result['edge_right_level']:.6f}, "
+                    f"edge_span_ratio={result['edge_span_ratio']:.3f}, "
+                    f"end_to_end={result['end_to_end']:.6f}, "
+                    f"total_var={result['total_var']:.6f}, "
+                    f"interior_peak={int(result['interior_peak'])}, "
+                    f"interior_valley={int(result['interior_valley'])}, "
+                    f"forced_synth={int(result['forced_synthetic_monotonic'])}"
+                )
+
+            all_repeated_processed[axis].append(result)
+
+            save_processed_scan_csv(
+                axis,
+                scan_no,
+                result,
+                os.path.join(axis_dir, f"axis{axis+1}_scan{scan_no}_processed.csv")
+            )
+
+            save_individual_scan_plots(
+                axis,
+                scan_no,
+                result,
+                axis_dir,
+                t0_info=t0_info
+            )
+
+        # --------------------------------------
+        # Axis average
+        # --------------------------------------
+        avg_result = average_processed_scans(all_repeated_processed[axis])
+
+        if avg_result is not None:
+            save_average_csv(
+                axis,
+                avg_result,
+                os.path.join(axis_dir, f"axis{axis+1}_average_processed.csv")
+            )
+            save_average_plots(axis, avg_result, axis_dir, t0_info=t0_info)
+            popup_average_plots(axis, avg_result, t0_info=t0_info)
+
+            sigma_txt = "None" if avg_result["sigma"] is None else f"{avg_result['sigma']:.4f}"
+            w4_txt = "None" if avg_result["width_4sigma"] is None else f"{avg_result['width_4sigma']:.4f}"
+            print(f"Axis {axis+1} average: sigma={sigma_txt}, width_4sigma={w4_txt}")
+        else:
+            print(f"Axis {axis+1}: no average generated")
+
+finally:
+    ser.close()
+
+count_log_path = save_scan_count_log(run_dir, axis_count_logs)
+print(f"Saved scan count log to: {count_log_path}")
+print(f"\nSaved all results to: {run_dir}")
+plt.show()
+
+

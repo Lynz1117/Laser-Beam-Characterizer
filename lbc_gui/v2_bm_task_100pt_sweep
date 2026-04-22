@@ -1,0 +1,296 @@
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+
+PORT = "COM3"
+BAUD = 115200
+
+ser = serial.Serial(PORT, BAUD, timeout=1)
+
+# ===== Geometry (your setup) =====
+# arm width = 2.5 cm = 25 mm
+R_MM = 25.0
+
+# ===== Photodiode / TIA calibration =====
+RF_OHMS = 40_800          # 40.8 kΩ
+RESP_A_PER_W = 60e-6      # 60 µA/W = 60e-6 A/W
+
+
+def moving_average(y, w=5):
+    y = np.asarray(y, dtype=float)
+    if y.size < w:
+        return y
+    if w % 2 == 0:
+        w += 1
+    k = np.ones(w) / w
+    return np.convolve(y, k, mode="same")
+
+def parse_bm(line):
+    line = line.strip()
+    if line == "BM_DONE":
+        return ("DONE",)
+    if not line.startswith("BM,"):
+        return None
+    p = line.split(",")
+    if len(p) < 4:
+        return None
+    try:
+        t_ms = int(p[1])
+        deg  = float(p[2])
+        v    = float(p[3])
+        return ("BM", t_ms, deg, v)
+    except ValueError:
+        return None
+
+def collapse_duplicates(deg, v, quantize=None):
+    """
+    Collapse duplicate (or nearly duplicate) degrees by averaging voltages.
+    quantize: set (e.g.) 0.1 or 0.01 if your degrees have float jitter.
+    Returns strictly increasing deg_u and averaged v_u.
+    """
+    deg = np.asarray(deg, float)
+    v   = np.asarray(v, float)
+
+    if quantize is not None:
+        deg = np.round(deg / quantize) * quantize
+
+    order = np.argsort(deg)
+    deg = deg[order]
+    v   = v[order]
+
+    deg_u, inv = np.unique(deg, return_inverse=True)
+    v_sum = np.bincount(inv, weights=v)
+    v_cnt = np.bincount(inv)
+    v_u = v_sum / np.maximum(v_cnt, 1)
+
+    return deg_u, v_u
+
+def resample_uniform(x, y, step=None):
+    """
+    Resample (x,y) onto a uniform x-grid to stabilize derivative.
+    step: if None, uses median positive spacing.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    if x.size < 2:
+        return x, y
+
+    dx = np.diff(x)
+    dx = dx[dx > 0]
+    if dx.size == 0:
+        return x, y
+
+    if step is None:
+        step = float(np.median(dx))
+
+    x0, x1 = float(x[0]), float(x[-1])
+    grid = np.arange(x0, x1 + 0.5 * step, step)
+    yg = np.interp(grid, x, y)
+    return grid, yg
+
+def crop_to_first_peak(x, y, threshold_ratio=0.15):
+    """
+    Keep only the region around the FIRST peak (left-most dominant peak).
+    threshold_ratio defines the width by cutting where y drops below
+    threshold_ratio * peak_value.
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+
+    if y.size == 0 or np.max(y) <= 0:
+        return x, y
+
+    peak_idx = int(np.argmax(y))
+    peak_val = float(y[peak_idx])
+    thresh = peak_val * float(threshold_ratio)
+
+    left = peak_idx
+    while left > 0 and y[left] > thresh:
+        left -= 1
+
+    right = peak_idx
+    while right < y.size - 1 and y[right] > thresh:
+        right += 1
+
+    return x[left:right+1], y[left:right+1]
+
+def beam_width_1e2(x_mm, profile):
+    """
+    1/e^2 beam width:
+      - Find peak (x0, y0)
+      - y_th = y0 / e^2
+      - Find x1 (left) and x2 (right) crossings via linear interpolation
+      - width = x2 - x1
+    Returns dict with x0,y0,x1,y1,x2,y2,width_1e2 or None if not found.
+    """
+    x = np.asarray(x_mm, float)
+    y = np.asarray(profile, float)
+
+    if y.size < 3 or np.max(y) <= 0:
+        return None
+
+    peak_idx = int(np.argmax(y))
+    x0 = float(x[peak_idx])
+    y0 = float(y[peak_idx])
+
+    y_th = y0 / (np.e ** 2)
+
+    # Left crossing (moving left from peak)
+    x1 = None
+    for i in range(peak_idx, 0, -1):
+        if y[i] >= y_th and y[i-1] < y_th:
+            # linear interpolation between (x[i-1],y[i-1]) and (x[i],y[i])
+            denom = (y[i] - y[i-1])
+            if abs(denom) < 1e-15:
+                x1 = float(x[i])
+            else:
+                x1 = float(x[i-1] + (y_th - y[i-1]) * (x[i] - x[i-1]) / denom)
+            break
+
+    # Right crossing (moving right from peak)
+    x2 = None
+    for i in range(peak_idx, y.size - 1):
+        if y[i] >= y_th and y[i+1] < y_th:
+            denom = (y[i+1] - y[i])
+            if abs(denom) < 1e-15:
+                x2 = float(x[i])
+            else:
+                x2 = float(x[i] + (y_th - y[i]) * (x[i+1] - x[i]) / denom)
+            break
+
+    if x1 is None or x2 is None or x2 <= x1:
+        return None
+
+    return {
+        "x0": x0, "y0": y0,
+        "x1": x1, "y1": float(y_th),
+        "x2": x2, "y2": float(y_th),
+        "width_1e2": float(x2 - x1),
+    }
+
+print("Listening... waiting for one 0→180 scan (BM... then BM_DONE)")
+
+t_list, deg_list, v_list = [], [], []
+
+while True:
+    s = ser.readline().decode(errors="ignore")
+    if not s:
+        continue
+
+    msg = parse_bm(s)
+    if msg is None:
+        continue
+
+    if msg[0] == "DONE":
+        print("Scan complete.")
+        break
+
+    _, t_ms, deg, v = msg
+    t_list.append(t_ms)
+    deg_list.append(deg)
+    v_list.append(v)
+
+deg_raw = np.asarray(deg_list, float)
+v_raw   = np.asarray(v_list, float)
+
+# ===== 1) Remove duplicate degrees (so derivative isn't biased) =====
+# If you have float jitter in degrees, set quantize=0.1 or 0.01
+deg_u, v_u = collapse_duplicates(deg_raw, v_raw, quantize=None)
+
+# ===== 2) Resample to uniform degree grid (recommended) =====
+deg_g, v_g = resample_uniform(deg_u, v_u, step=None)
+
+# ===== 3) Smooth voltage in degree domain (plots stay in degrees) =====
+v_s = moving_average(v_g, w=5)
+
+# ===== Convert Voltage -> Optical Power (Watts) =====
+# P = V / (Rf * Responsivity)
+P_watts = v_s / (RF_OHMS * RESP_A_PER_W)
+
+# Optional: convert to mW for readability (does NOT affect width math)
+P_mW = P_watts * 1000.0
+
+# Derivative for DISPLAY (still in degrees)
+dv_ddeg = np.gradient(v_s, deg_g)
+
+# ===== 4) Convert degree axis to mm internally for PHYSICAL width =====
+theta_rad = np.deg2rad(deg_g)
+x_mm = R_MM * theta_rad
+
+# Derivative for BEAM PROFILE in mm
+#dv_dx = np.gradient(v_s, x_mm)
+#prof = np.abs(dv_dx)
+
+# Derivative of POWER with respect to position (true knife-edge theory)
+dP_dx = np.gradient(P_watts, x_mm)
+
+# Knife-edge beam profile (intensity ~ dP/dx)
+prof = np.clip(dP_dx, 0, None)  # better than abs() for one-sided edge
+
+# ===== 5) Keep only the FIRST peak (prevents double-peak width) =====
+# deg_crop, prof_crop = crop_to_first_peak(deg_g, prof, threshold_ratio=0.15)
+# Make a matching mm axis for the same crop range
+# x_mm_crop = R_MM * np.deg2rad(deg_crop)
+# =====================================
+# Fixed crop window for first beam edge
+# (based on your scan: first peak ~20–70 deg)
+# =====================================
+CROP_MIN_DEG = 20.0
+CROP_MAX_DEG = 75.0
+
+mask = (deg_g >= CROP_MIN_DEG) & (deg_g <= CROP_MAX_DEG)
+
+deg_crop = deg_g[mask]
+prof_crop = prof[mask]
+
+# Matching mm axis for width calculation
+x_mm_crop = R_MM * np.deg2rad(deg_crop)
+
+# ===== 6) 1/e^2 width calculation (x0,y0, x1,y1, x2,y2, width=x2-x1) =====
+result = beam_width_1e2(x_mm_crop, prof_crop)
+
+if result is None:
+    print("\n1/e^2 width: crossings not found (try adjusting smoothing window or crop threshold).")
+else:
+    x0, y0 = result["x0"], result["y0"]
+    x1, y1 = result["x1"], result["y1"]
+    x2, y2 = result["x2"], result["y2"]
+    w_1e2_mm = result["width_1e2"]
+
+    print("\nBeam Width Results (1/e^2 method, FIRST PEAK ONLY):")
+    print(f"  Peak (x0, y0)   = ({x0:.4f} mm, {y0:.6f})")
+    print(f"  1/e^2 (x1, y1)  = ({x1:.4f} mm, {y1:.6f})")
+    print(f"  1/e^2 (x2, y2)  = ({x2:.4f} mm, {y2:.6f})")
+    print(f"  Beam Width (x2-x1) = {w_1e2_mm:.4f} mm")
+
+# ===== Plots stay in DEGREES (as requested) =====
+plt.figure()
+plt.plot(deg_g, v_s)
+plt.grid(True)
+plt.xlabel("Angle (deg)")
+plt.ylabel("Voltage (V)")
+plt.title("Voltage vs Angle (one scan, duplicates removed)")
+
+plt.figure()
+plt.plot(deg_g, dv_ddeg)
+plt.grid(True)
+plt.xlabel("Angle (deg)")
+plt.ylabel("dV/dAngle (V/deg)")
+plt.title("Derivative (display only)")
+
+plt.figure()
+plt.plot(deg_crop, prof_crop)
+plt.grid(True)
+plt.xlabel("Angle (deg)")
+plt.ylabel("|dV/dx| (arb)")
+plt.title("Knife-edge Profile (first peak only)")
+
+# Optional: overlay 1/e^2 markers on the degree plot
+if result is not None:
+    deg0 = np.rad2deg(x0 / R_MM)
+    deg1 = np.rad2deg(x1 / R_MM)
+    deg2 = np.rad2deg(x2 / R_MM)
+    plt.axhline(y=y1, linestyle="--")
+    plt.scatter([deg0, deg1, deg2], [y0, y1, y2], zorder=3)
+
+plt.show()

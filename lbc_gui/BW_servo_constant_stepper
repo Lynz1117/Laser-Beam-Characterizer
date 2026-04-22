@@ -1,0 +1,909 @@
+import os
+import time
+import math
+import queue
+import threading
+from datetime import datetime
+
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
+
+# ============================================================
+# User settings
+# ============================================================
+USE_FAKE_SERIAL = False   # True = simulate STM32 data, False = use real serial
+
+PORT = "COM3"
+BAUD = 115200
+
+START_CMD = b"START\n"
+ABORT_CMD = b"ABORT\n"
+
+R_MM = 25.0          # pivot -> knife edge radius
+MA_W_V = 11           # voltage smoothing
+MA_W_P = 11           # normalized power smoothing
+MA_W_D = 13           # derivative smoothing
+
+STALL_TIMEOUT_S = 3.0
+SCAN_TIMEOUT_S = 90.0
+
+PROFILE_THRESH_FRAC = 0.10   # keep only profile above 10% of peak
+PROFILE_HALF_WIN_MM = 3.0    # keep ±5 mm around main derivative peak
+
+# ============================================================
+# Helpers
+# ============================================================
+def moving_average(y, w):
+    y = np.asarray(y, float)
+    if len(y) < max(3, w):
+        return y
+    if w % 2 == 0:
+        w += 1
+    k = np.ones(w) / w
+    return np.convolve(y, k, mode="same")
+
+
+def parse_bm(line):
+    """
+    Accept:
+      BM,scan_num,t_ms,deg,v
+      BM_DONE,scan_num
+      SCAN_BEGIN,scan_num
+      STEPPER_MOVE_BEGIN,scan_num
+      STEPPER_MOVE_DONE,scan_num
+      ALL_SCANS_DONE
+      ACK_START / ACK_ABORT
+    """
+    line = line.strip()
+
+    if line == "ACK_START":
+        return ("ACK_START",)
+    if line == "ACK_ABORT":
+        return ("ACK_ABORT",)
+    if line == "ALL_SCANS_DONE":
+        return ("ALL_DONE",)
+
+    if line.startswith("SCAN_BEGIN,"):
+        p = line.split(",")
+        try:
+            return ("SCAN_BEGIN", int(p[1]))
+        except ValueError:
+            return None
+
+    if line.startswith("STEPPER_MOVE_BEGIN,"):
+        p = line.split(",")
+        try:
+            return ("STEP_BEGIN", int(p[1]))
+        except ValueError:
+            return None
+
+    if line.startswith("STEPPER_MOVE_DONE,"):
+        p = line.split(",")
+        try:
+            return ("STEP_DONE", int(p[1]))
+        except ValueError:
+            return None
+
+    if line.startswith("BM_DONE,"):
+        p = line.split(",")
+        try:
+            return ("DONE", int(p[1]))
+        except ValueError:
+            return None
+
+    if line == "BM_DONE":
+        return ("DONE", None)
+
+    if not line.startswith("BM,"):
+        return None
+
+    p = line.split(",")
+    try:
+        # New format: BM,scan_num,t_ms,deg,v
+        if len(p) == 5:
+            return ("BM", int(p[1]), int(p[2]), float(p[3]), float(p[4]))
+
+        # Old format fallback: BM,t_ms,deg,v
+        if len(p) == 4:
+            return ("BM_OLD", int(p[1]), float(p[2]), float(p[3]))
+    except ValueError:
+        return None
+
+    return None
+
+
+def normalize_power(v):
+    """
+    Normalize to 0..1 and make the knife-edge curve go high -> low.
+    """
+    v = np.asarray(v, float)
+    v_lo = float(np.min(v))
+    v_hi = float(np.max(v))
+
+    P = (v - v_lo) / (v_hi - v_lo + 1e-12)
+    P = np.clip(P, 0.0, 1.0)
+
+    k = max(5, len(P) // 10)
+    if np.mean(P[:k]) < np.mean(P[-k:]):
+        P = 1.0 - P
+
+    return P, v_lo, v_hi
+
+
+def weighted_stats_from_profile(x, prof):
+    """
+    Compute weighted mean, sigma, and 4 sigma beam width from beam profile.
+    """
+    x = np.asarray(x, float)
+    prof = np.asarray(prof, float)
+
+    prof = np.maximum(prof, 0.0)
+    s = float(np.sum(prof))
+    if s <= 0 or len(x) < 3:
+        return None, None, None
+
+    mu = float(np.sum(x * prof) / s)
+    var = float(np.sum(prof * (x - mu) ** 2) / s)
+    sigma = float(np.sqrt(max(var, 0.0)))
+    width_4sigma = 4.0 * sigma
+    return mu, sigma, width_4sigma
+
+def crop_main_lobe(x, profile, half_win_mm=PROFILE_HALF_WIN_MM, thresh_frac=PROFILE_THRESH_FRAC):
+    """
+    Keep only the main beam-profile lobe around the strongest peak.
+    Also suppress small baseline noise.
+    """
+    x = np.asarray(x, float)
+    profile = np.asarray(profile, float)
+
+    if len(x) < 5:
+        return x, profile
+
+    profile = np.maximum(profile, 0.0)
+
+    i_peak = int(np.argmax(profile))
+    x_peak = x[i_peak]
+    p_peak = profile[i_peak]
+
+    if p_peak <= 0:
+        return x, profile
+
+    keep = (x >= (x_peak - half_win_mm)) & (x <= (x_peak + half_win_mm))
+    x_c = x[keep]
+    p_c = profile[keep]
+
+    if len(x_c) < 5:
+        return x, profile
+
+    thresh = thresh_frac * np.max(p_c)
+    p_c = np.where(p_c >= thresh, p_c, 0.0)
+
+    # Trim leading/trailing zeros after thresholding
+    nz = np.flatnonzero(p_c > 0)
+    if len(nz) >= 3:
+        x_c = x_c[nz[0]:nz[-1] + 1]
+        p_c = p_c[nz[0]:nz[-1] + 1]
+
+    return x_c, p_c
+
+def process_scan(t_ms, deg, v):
+    """
+    Convert one completed scan into:
+    - smoothed voltage
+    - normalized knife-edge curve
+    - derivative beam profile
+    - mean, sigma, 4 sigma width
+    """
+    t_ms = np.asarray(t_ms, float)
+    deg = np.asarray(deg, float)
+    v = np.asarray(v, float)
+
+    if len(t_ms) < 10:
+        return None
+
+    t_s = (t_ms - t_ms[0]) / 1000.0
+
+    # Smooth voltage
+    v_s = moving_average(v, MA_W_V)
+
+    # Convert angle to arc position
+    theta_rad = np.deg2rad(deg - deg[0])
+    x_mm = R_MM * theta_rad
+
+    # Sort by x
+    order = np.argsort(x_mm)
+    x_mm = x_mm[order]
+    t_s = t_s[order]
+    deg = deg[order]
+    v_s = v_s[order]
+
+    if len(x_mm) < 5:
+        return None
+
+    # Normalize knife-edge curve
+    P, v_lo, v_hi = normalize_power(v_s)
+    P = moving_average(P, MA_W_P)
+    P = np.clip(P, 0.0, 1.0)
+
+    # Derivative beam profile using actual x-axis
+    dPdx = np.gradient(P, x_mm)
+    profile_full = -dPdx
+    profile_full = moving_average(profile_full, MA_W_D)
+    profile_full = np.maximum(profile_full, 0.0)
+
+    # Remove tiny baseline/tail artifacts
+    pmax = float(np.max(profile_full))
+    if pmax > 0:
+        thr = 0.05 * pmax
+        profile_full = np.where(profile_full >= thr, profile_full, 0.0)
+
+    # Keep only main lobe
+    x_prof, profile = crop_main_lobe(x_mm, profile_full)
+
+    # Compute beam statistics on cropped profile
+    mu, sigma, width_4sigma = weighted_stats_from_profile(x_prof, profile)
+    if mu is None:
+        x_prof_centered = x_prof
+    else:
+        x_prof_centered = x_prof - mu
+
+    return {
+        "t_s": t_s,
+        "x_mm": x_mm,
+        "deg": deg,
+        "v_s": v_s,
+        "P": P,
+        "profile_full": profile_full,
+        "x_prof": x_prof_centered,   # centered so beam center is 0 mm
+        "profile": profile,
+        "mu": mu,
+        "sigma": sigma,
+        "width_4sigma": width_4sigma,
+        "v_lo": v_lo,
+        "v_hi": v_hi,
+    }
+
+
+def average_processed_scans(results):
+    """
+    Average multiple processed scans on a common x-axis.
+    """
+    if not results:
+        return None
+    if len(results) == 1:
+        return results[0]
+
+    x0 = max(r["x_mm"][0] for r in results)
+    x1 = min(r["x_mm"][-1] for r in results)
+    if x1 <= x0:
+        return None
+
+    n = min(len(r["x_mm"]) for r in results)
+    x_common = np.linspace(x0, x1, n)
+
+    v_stack = []
+    p_stack = []
+    t_stack = []
+
+    for r in results:
+        v_stack.append(np.interp(x_common, r["x_mm"], r["v_s"]))
+        p_stack.append(np.interp(x_common, r["x_mm"], r["P"]))
+        t_stack.append(np.interp(x_common, r["x_mm"], r["t_s"]))
+
+    v_avg = np.mean(np.vstack(v_stack), axis=0)
+    p_avg = np.mean(np.vstack(p_stack), axis=0)
+    t_avg = np.mean(np.vstack(t_stack), axis=0)
+
+    # Recompute derivative from averaged knife-edge curve
+    dPdx_avg = np.gradient(p_avg, x_common)
+    prof_full_avg = -dPdx_avg
+    prof_full_avg = moving_average(prof_full_avg, MA_W_D)
+    prof_full_avg = np.maximum(prof_full_avg, 0.0)
+
+    pmax = float(np.max(prof_full_avg))
+    if pmax > 0:
+        thr = 0.05 * pmax
+        prof_full_avg = np.where(prof_full_avg >= thr, prof_full_avg, 0.0)
+
+    x_prof, prof_avg = crop_main_lobe(x_common, prof_full_avg)
+    mu, sigma, width_4sigma = weighted_stats_from_profile(x_prof, prof_avg)
+
+    if mu is None:
+        x_prof_centered = x_prof
+    else:
+        x_prof_centered = x_prof - mu
+
+    return {
+        "t_s": t_avg,
+        "x_mm": x_common,
+        "deg": None,
+        "v_s": v_avg,
+        "P": p_avg,
+        "profile_full": prof_full_avg,
+        "x_prof": x_prof_centered,
+        "profile": prof_avg,
+        "mu": mu,
+        "sigma": sigma,
+        "width_4sigma": width_4sigma,
+        "v_lo": None,
+        "v_hi": None,
+    }
+
+
+# ============================================================
+# Fake serial data generator
+# ============================================================
+def make_fake_scan_lines():
+    lines = []
+    dt_ms = 20
+    total_ms = 15000
+    n = total_ms // dt_ms + 1
+
+    for scan_num in range(1, 21):
+        lines.append(f"SCAN_BEGIN,{scan_num}")
+
+        v_lo = 0.05
+        v_hi = 0.75
+
+        # shift center slightly with position
+        t0 = 9000.0 + 80.0 * scan_num
+        k = 380.0
+
+        for i in range(n):
+            t_ms = i * dt_ms
+            deg = 90.0 * (t_ms / total_ms)
+
+            p = 1.0 / (1.0 + math.exp((t_ms - t0) / k))
+            noise = np.random.normal(0.0, 0.003)
+            ripple = 0.004 * math.sin(2.0 * math.pi * t_ms / 140.0)
+
+            v = v_lo + (v_hi - v_lo) * p + noise + ripple
+            v = max(0.0, v)
+
+            lines.append(f"BM,{scan_num},{t_ms},{deg:.3f},{v:.6f}")
+
+        lines.append(f"BM_DONE,{scan_num}")
+
+        if scan_num < 20:
+            lines.append(f"STEPPER_MOVE_BEGIN,{scan_num}")
+            lines.append(f"STEPPER_MOVE_DONE,{scan_num}")
+
+    lines.append("ALL_SCANS_DONE")
+    return lines
+
+
+def send_fake_scan():
+    """
+    Push fake STM32 data into the same queue used by the GUI.
+    """
+    lines = make_fake_scan_lines()
+
+    def worker():
+        try:
+            rx_q.put_nowait("ACK_START")
+        except queue.Full:
+            pass
+
+        for line in lines:
+            if stop_reader:
+                return
+
+            # stop sending if user aborted
+            if sess.abort or not sess.active:
+                return
+
+            try:
+                rx_q.put_nowait(line)
+            except queue.Full:
+                pass
+
+            time.sleep(0.02)  # mimic ~50 Hz stream
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ============================================================
+# Serial reader thread
+# ============================================================
+rx_q = queue.Queue(maxsize=50000)
+stop_reader = False
+
+if not USE_FAKE_SERIAL:
+    ser = serial.Serial(PORT, BAUD, timeout=0.1)
+else:
+    ser = None
+
+
+def reader_thread():
+    global stop_reader
+
+    if USE_FAKE_SERIAL:
+        while not stop_reader:
+            time.sleep(0.05)
+        return
+
+    buf = b""
+    while not stop_reader:
+        try:
+            data = ser.read(ser.in_waiting or 1)
+            if not data:
+                continue
+
+            buf += data
+
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                s = line.decode(errors="ignore").strip()
+                try:
+                    rx_q.put_nowait(s)
+                except queue.Full:
+                    try:
+                        rx_q.get_nowait()
+                    except queue.Empty:
+                        pass
+        except Exception:
+            pass
+
+
+threading.Thread(target=reader_thread, daemon=True).start()
+
+
+# ============================================================
+# Session state
+# ============================================================
+class Session:
+    def __init__(self):
+        self.active = False
+        self.abort = False
+
+        # Number of full 20-position runs to average
+        self.target_runs = 1
+        self.done_runs = 0
+
+        # Current position scan being collected
+        self.cur_scan_num = None
+        self.cur_t_ms = []
+        self.cur_deg = []
+        self.cur_v = []
+
+        # One full run = up to 20 processed scans
+        self.current_run_results = []
+
+        # If averaging multiple full runs:
+        self.all_runs = []
+
+        # What to plot/save
+        self.last_result = None
+        self.last_run = None
+
+        self.scan_start_wall = None
+        self.last_bm_wall = None
+
+
+sess = Session()
+
+
+def flush_rx():
+    while True:
+        try:
+            rx_q.get_nowait()
+        except queue.Empty:
+            break
+
+
+def reset_current_scan_buffers():
+    sess.cur_scan_num = None
+    sess.cur_t_ms.clear()
+    sess.cur_deg.clear()
+    sess.cur_v.clear()
+
+def start_session(n_runs):
+    sess.active = True
+    sess.abort = False
+    sess.target_runs = int(n_runs)
+    sess.done_runs = 0
+
+    sess.current_run_results.clear()
+    sess.all_runs.clear()
+    sess.last_result = None
+    sess.last_run = None
+
+    sess.scan_start_wall = None
+    sess.last_bm_wall = None
+    reset_current_scan_buffers()
+
+    status_text.set_text(f"Collecting run 1/{sess.target_runs}...")
+    info_text.set_text("")
+    fig.canvas.draw_idle()
+
+    flush_rx()
+
+    if USE_FAKE_SERIAL:
+        send_fake_scan()
+    else:
+        ser.write(START_CMD)
+
+    print(f"[UI] START sent for {sess.target_runs} run(s).")
+
+
+def stop_session():
+    if not sess.active:
+        return
+
+    sess.abort = True
+    sess.active = False
+
+    if not USE_FAKE_SERIAL:
+        try:
+            ser.write(ABORT_CMD)
+        except Exception:
+            pass
+
+    status_text.set_text("Stopped")
+    fig.canvas.draw_idle()
+    print("[UI] Stopped.")
+
+
+def clear_plots():
+    sess.last_result = None
+
+    for ax in (ax1, ax2, ax3):
+        ax.cla()
+
+    ax1.set_title("Voltage vs Time")
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel("Voltage (V)")
+    ax1.grid(True)
+
+    ax2.set_title("Knife-Edge Curve")
+    ax2.set_xlabel("Position x (mm)")
+    ax2.set_ylabel("Normalized Power")
+    ax2.grid(True)
+
+    ax3.set_title("Beam Profile (Derivative)")
+    ax3.set_xlabel("Position x (mm)")
+    ax3.set_ylabel("Amplitude (1/mm)")
+    ax3.grid(True)
+
+    info_text.set_text("")
+    status_text.set_text("")
+    fig.canvas.draw_idle()
+
+
+def finalize_one_scan(scan_num):
+    result = process_scan(sess.cur_t_ms, sess.cur_deg, sess.cur_v)
+    reset_current_scan_buffers()
+
+    if result is None:
+        return False
+
+    result["scan_num"] = scan_num
+    result["stepper_mm"] = (scan_num - 1) * 10.0
+    sess.current_run_results.append(result)
+    return True
+
+
+def plot_result(result, label):
+    ax1.cla()
+    ax2.cla()
+    ax3.cla()
+
+    ax1.plot(result["t_s"], result["v_s"], linewidth=1.8)
+    ax1.set_title(f"Voltage vs Time — {label}")
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel("Voltage (V)")
+    ax1.grid(True)
+
+    ax2.plot(result["x_mm"], result["P"], linewidth=1.8)
+    ax2.set_title("Knife-Edge Curve")
+    ax2.set_xlabel("Position x (mm)")
+    ax2.set_ylabel("Normalized Power")
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.grid(True)
+
+    ax3.plot(result["x_prof"], result["profile"], linewidth=2.0, label="Beam profile = -dP/dx")
+    ax3.axvline(0.0, linestyle="--", linewidth=1.5, label="Center = 0 mm")
+    ax3.set_title("Beam Profile (Derivative)")
+    ax3.set_xlabel("Position relative to beam center (mm)")
+    ax3.set_ylabel("dP/dx (1/mm)")
+    ax3.grid(True)
+    ax3.legend(loc="best")
+
+    lines = [label]
+    if result["mu"] is not None:
+        lines.append(f"Mean = {result['mu']:.6f} mm")
+        lines.append(f"Std. dev. = {result['sigma']:.6f} mm")
+        lines.append(f"4σ beam width = {result['width_4sigma']:.6f} mm")
+    if result["v_lo"] is not None and result["v_hi"] is not None:
+        lines.append(f"V_lo = {result['v_lo']:.6f} V")
+        lines.append(f"V_hi = {result['v_hi']:.6f} V")
+
+    info_text.set_text("\n".join(lines))
+    status_text.set_text("Done")
+    fig.canvas.draw_idle()
+
+    sess.last_result = result
+
+def plot_full_run(run_results, label="Full Run"):
+    ax1.cla()
+    ax2.cla()
+    ax3.cla()
+
+    if not run_results:
+        status_text.set_text("No run data")
+        fig.canvas.draw_idle()
+        return
+
+    widths = []
+    pos_mm = []
+
+    for r in run_results:
+        s = r["scan_num"]
+        z = r["stepper_mm"]
+
+        ax1.plot(r["t_s"], r["v_s"], linewidth=1.0, label=f"S{s}")
+        ax2.plot(r["x_mm"], r["P"], linewidth=1.0, label=f"S{s}")
+
+        if r["width_4sigma"] is not None:
+            pos_mm.append(z)
+            widths.append(r["width_4sigma"])
+
+    ax1.set_title(f"Voltage vs Time — {label}")
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel("Voltage (V)")
+    ax1.grid(True)
+
+    ax2.set_title("Knife-Edge Curves")
+    ax2.set_xlabel("Position x (mm)")
+    ax2.set_ylabel("Normalized Power")
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.grid(True)
+
+    ax3.set_title("Beam Width vs Stepper Position")
+    ax3.set_xlabel("Stepper Position (mm)")
+    ax3.set_ylabel("4σ Beam Width (mm)")
+    ax3.grid(True)
+
+    if pos_mm and widths:
+        ax3.plot(pos_mm, widths, marker="o", linewidth=1.8)
+
+    info_lines = [label, f"Positions captured = {len(run_results)}"]
+    if widths:
+        i_min = int(np.argmin(widths))
+        info_lines.append(f"Min width = {widths[i_min]:.6f} mm at z = {pos_mm[i_min]:.3f} mm")
+
+    info_text.set_text("\n".join(info_lines))
+    status_text.set_text("Done")
+    fig.canvas.draw_idle()
+
+    sess.last_run = run_results
+    sess.last_result = run_results[0] if run_results else None
+
+def save_csv():
+    if sess.last_run is None or len(sess.last_run) == 0:
+        print("[UI] Nothing to save.")
+        return
+
+    outdir = "scan_csv"
+    os.makedirs(outdir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = os.path.join(outdir, f"knifeedge_run_{ts}.csv")
+
+    with open(fname, "w", newline="") as f:
+        f.write("scan_num,stepper_mm,mean_mm,sigma_mm,width_4sigma_mm\n")
+        for r in sess.last_run:
+            f.write(
+                f"{r['scan_num']},{r['stepper_mm']},{r['mu']},{r['sigma']},{r['width_4sigma']}\n"
+            )
+
+    print(f"[UI] Saved: {fname}")
+
+
+# ============================================================
+# GUI
+# ============================================================
+fig = plt.figure(figsize=(11, 8))
+ax1 = fig.add_subplot(3, 1, 1)
+ax2 = fig.add_subplot(3, 1, 2)
+ax3 = fig.add_subplot(3, 1, 3)
+
+plt.subplots_adjust(left=0.10, right=0.95, top=0.88, bottom=0.20, hspace=0.55)
+
+ax_btn1 = plt.axes([0.10, 0.05, 0.14, 0.08])
+ax_btn2 = plt.axes([0.27, 0.05, 0.14, 0.08])
+ax_btn3 = plt.axes([0.44, 0.05, 0.14, 0.08])
+ax_btn4 = plt.axes([0.61, 0.05, 0.14, 0.08])
+ax_btn5 = plt.axes([0.78, 0.05, 0.14, 0.08])
+
+btn_one = Button(ax_btn1, "One Run")
+btn_avg = Button(ax_btn2, "Avg 10 Runs")
+btn_stop = Button(ax_btn3, "Stop")
+btn_clear = Button(ax_btn4, "Clear")
+btn_save = Button(ax_btn5, "Save CSV")
+
+info_text = fig.text(0.01, 0.94, "", va="top", ha="left", fontsize=10)
+status_text = fig.text(0.82, 0.94, "", va="top", ha="left", fontsize=10)
+
+clear_plots()
+
+
+def on_one(event):
+    if sess.active:
+        print("[UI] Busy. Stop first.")
+        return
+    start_session(1)
+
+
+def on_avg(event):
+    if sess.active:
+        print("[UI] Busy. Stop first.")
+        return
+    start_session(10)
+
+
+def on_stop(event):
+    stop_session()
+
+
+def on_clear(event):
+    clear_plots()
+
+
+def on_save(event):
+    save_csv()
+
+
+btn_one.on_clicked(on_one)
+btn_avg.on_clicked(on_avg)
+btn_stop.on_clicked(on_stop)
+btn_clear.on_clicked(on_clear)
+btn_save.on_clicked(on_save)
+
+mode_name = "FAKE SERIAL MODE" if USE_FAKE_SERIAL else f"REAL SERIAL MODE ({PORT})"
+print(f"GUI ready. {mode_name}")
+
+
+# ============================================================
+# Main loop
+# ============================================================
+while plt.fignum_exists(fig.number):
+    if sess.active and sess.last_bm_wall is not None:
+        if (time.time() - sess.last_bm_wall) > STALL_TIMEOUT_S:
+            print("[WARN] Stream stalled -> ABORT")
+            if not USE_FAKE_SERIAL:
+                try:
+                    ser.write(ABORT_CMD)
+                except Exception:
+                    pass
+            sess.active = False
+            sess.abort = True
+            status_text.set_text("Stalled")
+            fig.canvas.draw_idle()
+
+    if sess.active and sess.scan_start_wall is not None:
+        if (time.time() - sess.scan_start_wall) > SCAN_TIMEOUT_S:
+            print("[WARN] Scan timeout -> ABORT")
+            if not USE_FAKE_SERIAL:
+                try:
+                    ser.write(ABORT_CMD)
+                except Exception:
+                    pass
+            sess.active = False
+            sess.abort = True
+            status_text.set_text("Timeout")
+            fig.canvas.draw_idle()
+
+    got_any = False
+
+    while True:
+        try:
+            line = rx_q.get_nowait()
+            got_any = True
+        except queue.Empty:
+            break
+
+        msg = parse_bm(line)
+        if msg is None:
+            continue
+
+        if msg[0] in ("ACK_START", "ACK_ABORT"):
+            continue
+
+        if not sess.active or sess.abort:
+            continue
+
+        if msg[0] == "SCAN_BEGIN":
+            _, scan_num = msg
+            reset_current_scan_buffers()
+            sess.cur_scan_num = scan_num
+            sess.scan_start_wall = time.time()
+            sess.last_bm_wall = time.time()
+            status_text.set_text(
+                f"Run {sess.done_runs + 1}/{sess.target_runs} — Position {scan_num}/20"
+            )
+            fig.canvas.draw_idle()
+
+        elif msg[0] == "BM":
+            _, scan_num, t_ms, deg, v = msg
+
+            if sess.cur_scan_num is None:
+                sess.cur_scan_num = scan_num
+
+            sess.cur_t_ms.append(t_ms)
+            sess.cur_deg.append(deg)
+            sess.cur_v.append(v)
+            sess.last_bm_wall = time.time()
+
+        elif msg[0] == "BM_OLD":
+            _, t_ms, deg, v = msg
+            if sess.cur_scan_num is None:
+                sess.cur_scan_num = 1
+            sess.cur_t_ms.append(t_ms)
+            sess.cur_deg.append(deg)
+            sess.cur_v.append(v)
+            sess.last_bm_wall = time.time()
+
+        elif msg[0] == "DONE":
+            _, scan_num = msg
+            if scan_num is None:
+                scan_num = sess.cur_scan_num if sess.cur_scan_num is not None else 1
+
+            ok = finalize_one_scan(scan_num)
+            if ok:
+                print(f"[POSITION] {scan_num}/20 done.")
+
+        elif msg[0] == "STEP_BEGIN":
+            _, scan_num = msg
+            status_text.set_text(
+                f"Run {sess.done_runs + 1}/{sess.target_runs} — Moving after {scan_num}/20"
+            )
+            fig.canvas.draw_idle()
+
+        elif msg[0] == "STEP_DONE":
+            _, scan_num = msg
+            pass
+
+        elif msg[0] == "ALL_DONE":
+            sess.done_runs += 1
+            sess.all_runs.append(list(sess.current_run_results))
+
+            print(f"[RUN] {sess.done_runs}/{sess.target_runs} done.")
+
+            if sess.done_runs >= sess.target_runs:
+                # For now, plot the last run
+                plot_full_run(sess.current_run_results,
+                              label="Single Run" if sess.target_runs == 1 else f"Run {sess.done_runs}")
+                sess.active = False
+                print("[RUN] Complete. Ready.")
+            else:
+                sess.current_run_results = []
+                reset_current_scan_buffers()
+                sess.scan_start_wall = None
+                sess.last_bm_wall = None
+                status_text.set_text(f"Collecting run {sess.done_runs + 1}/{sess.target_runs}...")
+                fig.canvas.draw_idle()
+
+                if USE_FAKE_SERIAL:
+                    send_fake_scan()
+                else:
+                    try:
+                        ser.write(START_CMD)
+                    except Exception:
+                        pass
+
+            break
+
+    if not got_any:
+        plt.pause(0.01)
+    else:
+        plt.pause(0.001)
+
+# Cleanup
+stop_reader = True
+if ser is not None:
+    try:
+        ser.close()
+    except Exception:
+        pass

@@ -1,0 +1,428 @@
+import serial
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import csv
+import os
+from datetime import datetime
+
+PORT        = "COM8"
+BAUD        = 115200
+FFT_SAMPLES = 4096
+WL_NUM_RUNS = 10
+
+# Effective time spacing for wave plot
+# Firmware sends every 4th sample at 200kHz → 20us per displayed point
+WAVE_DT_US  = 4.0 / 200000.0 * 1e6   # = 20.0 us
+
+timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+out_dir     = f"wavelength_{timestamp}"
+os.makedirs(out_dir, exist_ok=True)
+
+print(f"Saving data to: {out_dir}/")
+
+ser = serial.Serial(PORT, BAUD, timeout=2)
+
+ser.write(b"Wavelength\n")
+print("Sent: Wavelength command")
+
+run_nums        = []
+run_wavelengths = []
+run_f_peaks     = []
+run_samples     = []
+run_dirs        = []
+
+all_wave_data   = []
+spec_lambda     = []
+spec_mag_vs     = []
+last_status     = "Waiting for data..."
+final_lambda    = None
+
+plt.ion()
+fig = plt.figure(figsize=(12, 9))
+gs  = gridspec.GridSpec(3, 1, figure=fig)
+
+ax_wave = fig.add_subplot(gs[0])
+ax_runs = fig.add_subplot(gs[1])
+ax_spec = fig.add_subplot(gs[2])
+
+# ------------------------------------------------------------------
+# CSV helpers
+# ------------------------------------------------------------------
+def save_wave_csv(run_no, direction, data, f_peak=0.0, lambda_nm=0.0):
+    path = os.path.join(out_dir, f"run_{run_no:02d}_timedomain.csv")
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["sample_index", "time_ms", "adc_counts",
+                         "run", "direction", "f_peak_hz", "lambda_nm"])
+        for i, val in enumerate(data):
+            writer.writerow([i,
+                             round(i * WAVE_DT_US / 1000.0, 6),
+                             val, run_no, direction, f_peak, lambda_nm])
+
+def save_runs_csv():
+    path = os.path.join(out_dir, "runs_summary.csv")
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["run_number", "direction",
+                         "lambda_nm", "f_peak_hz", "chunks_this_run"])
+        for i in range(len(run_nums)):
+            writer.writerow([
+                run_nums[i],
+                run_dirs[i]    if i < len(run_dirs)    else "",
+                run_wavelengths[i],
+                run_f_peaks[i] if i < len(run_f_peaks) else "",
+                run_samples[i] if i < len(run_samples)  else "",
+            ])
+
+def save_spectrum_csv():
+    path = os.path.join(out_dir, "spectrum.csv")
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["wavelength_nm", "magnitude_vs"])
+        for lam, mag in zip(spec_lambda, spec_mag_vs):
+            writer.writerow([lam, mag])
+
+def save_final_result_csv(valid, lambda_nm, f_avg_runs,
+                          f_avg_spectrum, v_mm_s, total_chunks=0):
+    path = os.path.join(out_dir, "final_result.csv")
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["parameter", "value"])
+        writer.writerow(["timestamp",          timestamp])
+        writer.writerow(["valid_runs",         valid])
+        writer.writerow(["total_runs",         WL_NUM_RUNS])
+        writer.writerow(["lambda_nm",          lambda_nm])
+        writer.writerow(["f_avg_runs_hz",      f_avg_runs])
+        writer.writerow(["f_avg_spectrum_hz",  f_avg_spectrum])
+        writer.writerow(["v_mm_s",             v_mm_s])
+        writer.writerow(["total_chunks",       total_chunks])
+        writer.writerow(["formula",            "lambda = 2 * v / f"])
+
+def save_all_plots():
+    fig.savefig(os.path.join(out_dir, "all_plots.png"),
+                dpi=150, bbox_inches="tight")
+
+    # Time domain individual plot
+    fig_w, ax_w = plt.subplots(figsize=(10, 4))
+    if all_wave_data:
+        last      = all_wave_data[-1]
+        t_axis    = [i * WAVE_DT_US / 1000.0 for i in range(len(last["data"]))]
+        ax_w.plot(t_axis, last["data"], color="steelblue", linewidth=0.8)
+        dir_str   = "→ (0→50mm)" if last["dir"] == 1 else "← (50→0mm)"
+        f_peak    = last.get("f_peak",    0.0)
+        lambda_nm = last.get("lambda_nm", 0.0)
+        title     = (f"Time Domain Snapshot — Run {last['run']} {dir_str}  "
+                     f"({len(last['data'])} pts)")
+        if f_peak > 0:
+            title += f"  f={f_peak:.0f} Hz  λ={lambda_nm:.1f} nm"
+        ax_w.set_title(title)
+        ax_w.set_xlabel("Time (ms)")
+        ax_w.set_ylabel("ADC Counts")
+        ax_w.grid(True)
+    fig_w.tight_layout()
+    fig_w.savefig(os.path.join(out_dir, "plot_timedomain.png"),
+                  dpi=150, bbox_inches="tight")
+    plt.close(fig_w)
+
+    # Wavelength per run
+    fig_r, ax_r = plt.subplots(figsize=(10, 4))
+    ax_r.plot(run_nums, run_wavelengths, marker="o", color="seagreen")
+    ax_r.set_title("Wavelength per Run")
+    ax_r.set_xlabel("Run Number")
+    ax_r.set_ylabel("Wavelength (nm)")
+    ax_r.grid(True)
+    fig_r.tight_layout()
+    fig_r.savefig(os.path.join(out_dir, "plot_wavelength_per_run.png"),
+                  dpi=150, bbox_inches="tight")
+    plt.close(fig_r)
+
+    # Spectrum
+    fig_s, ax_s = plt.subplots(figsize=(10, 4))
+    if spec_lambda and spec_mag_vs:
+        ax_s.plot(spec_lambda, spec_mag_vs, color="darkorange", linewidth=0.8)
+        peak_idx = spec_mag_vs.index(max(spec_mag_vs))
+        peak_lam = spec_lambda[peak_idx]
+        peak_mag = spec_mag_vs[peak_idx]
+        ax_s.axvline(x=peak_lam, color="red", linestyle="--", linewidth=1)
+        ax_s.annotate(f"{peak_lam:.1f} nm",
+                      xy=(peak_lam, peak_mag),
+                      xytext=(10, -15),
+                      textcoords="offset points",
+                      color="red", fontsize=9)
+        ax_s.set_title(f"Averaged FFT Spectrum | {last_status}")
+        ax_s.set_xlabel("Wavelength (nm)")
+        ax_s.set_ylabel("Magnitude (V·s)")
+        ax_s.grid(True)
+    fig_s.tight_layout()
+    fig_s.savefig(os.path.join(out_dir, "plot_spectrum.png"),
+                  dpi=150, bbox_inches="tight")
+    plt.close(fig_s)
+
+    print(f"Plots saved to {out_dir}/")
+
+# ------------------------------------------------------------------
+# Parsers
+# ------------------------------------------------------------------
+def parse_keyvals(line):
+    parts = line.split(",")
+    kv = {}
+    for p in parts[1:]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            kv[k.strip()] = v.strip()
+    return parts[0].strip(), kv
+
+def read_item():
+    while True:
+        raw = ser.readline()
+        if not raw:
+            return None
+
+        line = raw.decode(errors="ignore").strip()
+        if not line:
+            return None
+
+        print(line)
+
+        # ----------------------------------------------------------
+        # Time domain frame — 128-point chunk snapshot
+        # ----------------------------------------------------------
+        if line.startswith("WAVE_BEGIN"):
+            _, kv     = parse_keyvals(line)
+            run_no    = int(kv.get("run",        "0"))
+            direction = int(kv.get("dir",        "1"))
+            expected  = int(kv.get("samples",    "128"))
+            f_peak    = float(kv.get("f_peak_hz","0"))
+            lambda_nm = float(kv.get("lambda_nm","0"))
+            w = []
+            while True:
+                raw2 = ser.readline()
+                if not raw2:
+                    continue
+                l2 = raw2.decode(errors="ignore").strip()
+                if l2.startswith("WAVE_END"):
+                    return ("WAVE", {"run":       run_no,
+                                     "dir":       direction,
+                                     "samples":   expected,
+                                     "f_peak_hz": f_peak,
+                                     "lambda_nm": lambda_nm,
+                                     "data":      w})
+                try:
+                    w.append(int(l2))
+                except ValueError:
+                    pass
+                if len(w) > 2048:
+                    break
+            return None
+
+        # ----------------------------------------------------------
+        # Spectrum frame
+        # ----------------------------------------------------------
+        if line.startswith("SPECTRUM_BEGIN"):
+            sx = []
+            sy = []
+            timeout_count = 0
+            while True:
+                raw2 = ser.readline()
+                if not raw2:
+                    timeout_count += 1
+                    if timeout_count > 10:
+                        return ("SPECTRUM", (sx, sy))
+                    continue
+                timeout_count = 0
+                l2 = raw2.decode(errors="ignore").strip()
+                if l2 == "SPECTRUM_END":
+                    return ("SPECTRUM", (sx, sy))
+                if l2.startswith("SPEC,"):
+                    parts = l2.split(",")
+                    if len(parts) == 4:
+                        try:
+                            lam = float(parts[2])
+                            mag = float(parts[3])
+                            if 0.0 < lam < 10000.0:
+                                sx.append(lam)
+                                sy.append(mag)
+                        except ValueError:
+                            pass
+                elif l2.startswith("FFT_DONE"):
+                    _, kv = parse_keyvals(l2)
+                    return ("SPECTRUM_THEN_DONE", (sx, sy, kv))
+
+        if line.startswith("FFT_RUN,"):
+            _, kv = parse_keyvals(line)
+            return ("FFT_RUN", kv)
+
+        if line.startswith("FFT_DONE"):
+            _, kv = parse_keyvals(line)
+            return ("FFT_DONE", kv)
+
+        if (
+            line.startswith("WAVELENGTH CMD RECEIVED")
+            or line.startswith("FFT_BEGIN")
+            or line.startswith("FFT_RUN_BEGIN")
+            or line.startswith("FFT_WALL_HIT")
+            or line.startswith("FFT_DIRECTION_FLIP")
+            or line.startswith("FFT_LEG_DONE")
+            or line.startswith("FFT_ERR")
+            or line.startswith("FFT_WARN")
+        ):
+            return ("STATUS", line)
+
+# ------------------------------------------------------------------
+# FFT_DONE handler
+# ------------------------------------------------------------------
+def handle_fft_done(payload):
+    global final_lambda, last_status
+    try:
+        valid         = int(payload.get("valid",               "0"))
+        final_lambda  = float(payload.get("lambda_nm",         "0"))
+        f_avg_runs    = float(payload.get("f_avg_runs_hz",     "0"))
+        f_avg_spec    = float(payload.get("f_avg_spectrum_hz", "0"))
+        v_mm_s        = float(payload.get("v_mm_s",            "0"))
+        total_chunks  = int(payload.get("total_chunks",        "0"))
+
+        if valid == 0:
+            last_status = "FFT_DONE — no valid runs, check signal"
+        else:
+            last_status = (f"Final wavelength = {final_lambda:.2f} nm  "
+                           f"({valid}/{WL_NUM_RUNS} valid runs)  "
+                           f"[{total_chunks} chunks]")
+
+        ax_spec.set_title(f"Averaged FFT Spectrum | {last_status}")
+        fig.suptitle(last_status, fontsize=10)
+        plt.tight_layout()
+        plt.pause(0.001)
+
+        print(f"\nFinal wavelength: {final_lambda:.2f} nm")
+        print(f"Total chunks accumulated: {total_chunks}\n")
+
+        save_runs_csv()
+        save_spectrum_csv()
+        save_final_result_csv(valid, final_lambda, f_avg_runs,
+                              f_avg_spec, v_mm_s, total_chunks)
+        save_all_plots()
+
+        print(f"All data saved to {out_dir}/")
+
+    except Exception as e:
+        print("Parse FFT_DONE error:", e)
+
+# ------------------------------------------------------------------
+# Main loop
+# ------------------------------------------------------------------
+while True:
+    item = read_item()
+    if item is None:
+        continue
+
+    kind, payload = item
+
+    if kind == "STATUS":
+        last_status = payload
+        fig.suptitle(last_status, fontsize=9)
+        plt.tight_layout()
+        plt.pause(0.001)
+
+    elif kind == "WAVE":
+        data      = payload["data"]
+        run_no    = payload["run"]
+        direction = payload["dir"]
+        f_peak    = payload.get("f_peak_hz", 0.0)
+        lambda_nm = payload.get("lambda_nm", 0.0)
+        dir_str   = "→ (0→50mm)" if direction == 1 else "← (50→0mm)"
+
+        all_wave_data.append({"run": run_no, "dir": direction,
+                               "data": data, "f_peak": f_peak,
+                               "lambda_nm": lambda_nm})
+        save_wave_csv(run_no, direction, data, f_peak, lambda_nm)
+
+        t_axis = [i * WAVE_DT_US / 1000.0 for i in range(len(data))]
+
+        ax_wave.cla()
+        ax_wave.plot(t_axis, data, color="steelblue", linewidth=0.8)
+
+        title = f"Time Domain — Run {run_no} {dir_str}  ({len(data)} pts)"
+        if f_peak > 0:
+            title += f"  f={f_peak:.0f} Hz  λ={lambda_nm:.1f} nm"
+        ax_wave.set_title(title)
+        ax_wave.set_xlabel("Time (ms)")
+        ax_wave.set_ylabel("ADC Counts")
+        ax_wave.grid(True)
+        plt.tight_layout()
+        plt.pause(0.001)
+
+    elif kind == "FFT_RUN":
+        try:
+            avg    = int(payload.get("avg",        "0"))
+            lam    = float(payload.get("lambda_nm","0"))
+            f_peak = float(payload.get("f_peak_hz","0"))
+            chunks = int(payload.get("chunks",     "0"))
+            last_dir = all_wave_data[-1]["dir"] if all_wave_data else 0
+
+            run_nums.append(avg)
+            run_wavelengths.append(lam)
+            run_f_peaks.append(f_peak)
+            run_samples.append(chunks)
+            run_dirs.append(last_dir)
+
+            ax_runs.cla()
+            ax_runs.plot(run_nums, run_wavelengths, marker="o", color="seagreen")
+            ax_runs.set_title("Wavelength per Run")
+            ax_runs.set_xlabel("Run Number")
+            ax_runs.set_ylabel("Wavelength (nm)")
+            ax_runs.grid(True)
+            plt.tight_layout()
+            plt.pause(0.001)
+        except Exception as e:
+            print("Parse FFT_RUN error:", e)
+
+    elif kind == "SPECTRUM":
+        spec_lambda, spec_mag_vs = payload
+
+        ax_spec.cla()
+        ax_spec.plot(spec_lambda, spec_mag_vs, color="darkorange", linewidth=0.8)
+
+        if spec_mag_vs:
+            peak_idx = spec_mag_vs.index(max(spec_mag_vs))
+            peak_lam = spec_lambda[peak_idx]
+            peak_mag = spec_mag_vs[peak_idx]
+            ax_spec.axvline(x=peak_lam, color="red", linestyle="--", linewidth=1)
+            ax_spec.annotate(f"{peak_lam:.1f} nm",
+                             xy=(peak_lam, peak_mag),
+                             xytext=(10, -15),
+                             textcoords="offset points",
+                             color="red", fontsize=9)
+
+        ax_spec.set_title("Averaged FFT Spectrum")
+        ax_spec.set_xlabel("Wavelength (nm)")
+        ax_spec.set_ylabel("Magnitude (V·s)")
+        ax_spec.grid(True)
+        plt.tight_layout()
+        plt.pause(0.001)
+
+    elif kind == "SPECTRUM_THEN_DONE":
+        sx, sy, done_kv = payload
+        spec_lambda, spec_mag_vs = sx, sy
+
+        ax_spec.cla()
+        ax_spec.plot(spec_lambda, spec_mag_vs, color="darkorange", linewidth=0.8)
+        if spec_mag_vs:
+            peak_idx = spec_mag_vs.index(max(spec_mag_vs))
+            peak_lam = spec_lambda[peak_idx]
+            peak_mag = spec_mag_vs[peak_idx]
+            ax_spec.axvline(x=peak_lam, color="red", linestyle="--", linewidth=1)
+            ax_spec.annotate(f"{peak_lam:.1f} nm",
+                             xy=(peak_lam, peak_mag),
+                             xytext=(10, -15),
+                             textcoords="offset points",
+                             color="red", fontsize=9)
+        ax_spec.set_title("Averaged FFT Spectrum")
+        ax_spec.set_xlabel("Wavelength (nm)")
+        ax_spec.set_ylabel("Magnitude (V·s)")
+        ax_spec.grid(True)
+        plt.tight_layout()
+        plt.pause(0.001)
+        handle_fft_done(done_kv)
+
+    elif kind == "FFT_DONE":
+        handle_fft_done(payload)

@@ -1,0 +1,117 @@
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+
+PORT = "COM9"
+BAUD = 115200
+
+ser = serial.Serial(PORT, BAUD, timeout=2)
+
+powers_mW = []
+voltages = []
+adc_counts = []
+
+print("Sending START...")
+ser.reset_input_buffer()
+ser.reset_output_buffer()
+ser.write(b"START\n")
+
+empty_count = 0
+
+while True:
+    line = ser.readline().decode(errors="ignore").strip()
+
+    if not line:
+        empty_count += 1
+        if empty_count > 20:
+            print("Timed out waiting for scan data.")
+            break
+        continue
+
+    empty_count = 0
+    print(line)
+
+    if line == "STOKES_DONE":
+        break
+    
+    # Example:
+    # I0 ADC=2871 V=2.3136 P=136.7391 mW
+    if line.startswith("I"):
+        try:
+            parts = line.split()
+
+            idx = int(parts[0][1:])
+            adc = int(parts[1].split("=")[1])
+            v = float(parts[2].split("=")[1])
+            p = float(parts[3].split("=")[1])
+
+            while len(adc_counts) <= idx:
+                adc_counts.append(None)
+                voltages.append(None)
+                powers_mW.append(None)
+
+            adc_counts[idx] = adc
+            voltages[idx] = v
+            powers_mW[idx] = p
+
+        except (IndexError, ValueError):
+            pass
+
+ser.close()
+
+adc_counts = np.array(adc_counts, dtype=float)
+voltages = np.array(voltages, dtype=float)
+powers_mW = np.array(powers_mW, dtype=float)
+
+if len(powers_mW) != 40 or np.any(np.isnan(powers_mW)):
+    print("Warning: did not receive all 40 Stokes samples correctly.")
+    print("Received:", powers_mW)
+else:
+    angles_deg = np.arange(8) * 22.5
+    angles_rad = np.deg2rad(angles_deg)
+
+    I = powers_mW
+
+    A = 2.0 * np.mean(I)
+    B = 4.0 * np.mean(I * np.sin(2 * angles_rad))
+    C = 4.0 * np.mean(I * np.cos(4 * angles_rad))
+    D = -4.0 * np.mean(I * np.sin(4 * angles_rad))
+
+    S0_raw = A - C
+
+    if abs(S0_raw) < 1e-12:
+        print("Error: S0 is too small, cannot normalize.")
+    else:
+        S1 = (2.0 * C) / S0_raw
+        S2 = (2.0 * D) / S0_raw
+        S3 = B / S0_raw
+        S0 = 1.0
+
+        S = np.array([S0, S1, S2, S3])
+
+        print("\nStokes intensity samples:")
+        for k in range(8):
+            print(f"I{k}: angle={angles_deg[k]:5.1f} deg, ADC={adc_counts[k]:.0f}, "
+                  f"V={voltages[k]:.4f}, P={powers_mW[k]:.4f} mW")
+
+        print("\nFourier coefficients:")
+        print(f"A = {A:.6f}")
+        print(f"B = {B:.6f}")
+        print(f"C = {C:.6f}")
+        print(f"D = {D:.6f}")
+
+        print("\nNormalized Stokes parameters:")
+        print(f"S0 = {S0:.4f}")
+        print(f"S1 = {S1:.4f}")
+        print(f"S2 = {S2:.4f}")
+        print(f"S3 = {S3:.4f}")
+        print(f"S  = {S}")
+
+        plt.figure(figsize=(8, 5))
+        plt.plot(angles_deg, powers_mW, marker='o')
+        plt.xlabel("QWP Angle (deg)")
+        plt.ylabel("Power (mW)")
+        plt.title("8-Point Stokes Scan")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()

@@ -1,0 +1,1120 @@
+import os
+from datetime import datetime
+
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# User settings
+# ============================================================
+PORT = "COM7"
+BAUD = 115200
+START_CMD = b"PROFILE\n"
+
+R_MM = 30.0
+
+SAVE_ROOT = "beam_profile_runs"
+
+# Processing settings
+MA_W_V = 5
+MA_W_P = 7
+MA_W_D = 5
+
+PROFILE_THRESH_FRAC = 0.06
+PROFILE_HALF_WIN_MM = 4.5
+EDGE_FRAC = 0.15
+MONO_SCORE_THRESH = 0.65
+
+SERIAL_TIMEOUT_S = 1.0
+EMPTY_LIMIT = 300
+
+# Repeated scan numbers after scan 0
+REPEATED_SCAN_MIN = 1
+REPEATED_SCAN_MAX = 10
+
+
+# ============================================================
+# Helpers
+# ============================================================
+def parse_keyvals(line: str):
+    out = {}
+    parts = line.strip().split(",")
+    for p in parts[1:]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def safe_float(d, key, default=None):
+    try:
+        return float(d[key])
+    except Exception:
+        return default
+
+
+def safe_int(d, key, default=None):
+    try:
+        return int(float(d[key]))
+    except Exception:
+        return default
+
+
+def parse_bm(line: str):
+    """
+    Expected STM32 format:
+    BM,axis,scan,t_ms,deg,stage,raw,v,p_mw
+    """
+    try:
+        parts = line.strip().split(",")
+        if len(parts) != 9:
+            return None
+        if parts[0] != "BM":
+            return None
+
+        return {
+            "axis": int(parts[1]),
+            "scan": int(parts[2]),
+            "t_ms": float(parts[3]),
+            "deg": float(parts[4]),
+            "stage": int(parts[5]),
+            "raw": int(parts[6]),
+            "v": float(parts[7]),
+            "p_mw": float(parts[8]),
+        }
+    except Exception:
+        return None
+
+def add_t0_overlay(ax, t0_info, axis="x"):
+    if t0_info is None:
+        return
+
+    if axis == "x":
+        xpos = t0_info["x_mm"]
+        ax.axvline(xpos, linestyle="--", linewidth=2,
+                   label=f"T0 = {xpos:.3f} mm")
+    elif axis == "deg":
+        xpos = t0_info["deg"]
+        ax.axvline(xpos, linestyle="--", linewidth=2,
+                   label=f"T0 = {xpos:.3f} deg")
+        
+def build_t0_info_from_scan(scan0, t0_meta):
+    if scan0 is None or t0_meta is None:
+        return None
+
+    idx = t0_meta.get("idx", None)
+    if idx is None:
+        return None
+
+    if idx < 0 or idx >= len(scan0["t_ms"]):
+        return None
+
+    deg0 = scan0["deg"][0]
+    deg_t0 = float(scan0["deg"][idx] - deg0)
+    x_t0 = float(R_MM * np.deg2rad(deg_t0))
+    p_t0 = float(scan0["p_mw"][idx])
+
+    return {
+        "idx": int(idx),
+        "t_ms": float(scan0["t_ms"][idx]),
+        "deg": deg_t0,
+        "x_mm": x_t0,
+        "p_mw": p_t0,
+    }
+
+def moving_average(y, w):
+    y = np.asarray(y, dtype=float)
+    if len(y) < max(3, w):
+        return y.copy()
+    if w % 2 == 0:
+        w += 1
+    pad = w // 2
+    ypad = np.pad(y, (pad, pad), mode="edge")
+    k = np.ones(w, dtype=float) / float(w)
+    return np.convolve(ypad, k, mode="valid")
+
+
+def normalize_01(y):
+    y = np.asarray(y, dtype=float)
+    y0 = np.min(y)
+    y1 = np.max(y)
+    if abs(y1 - y0) <= 1e-12:
+        return np.zeros_like(y)
+    return (y - y0) / (y1 - y0)
+
+
+def robust_edge_levels(sig, frac=EDGE_FRAC):
+    sig = np.asarray(sig, dtype=float)
+    n = len(sig)
+    k = max(3, int(frac * n))
+    left = np.median(sig[:k])
+    right = np.median(sig[-k:])
+    return left, right
+
+
+def is_mostly_monotonic(y):
+    y = np.asarray(y, dtype=float)
+    if len(y) < 8:
+        return True
+
+    dy = np.diff(y)
+    if np.all(np.abs(dy) < 1e-12):
+        return True
+
+    total_var = np.sum(np.abs(dy)) + 1e-12
+    end_to_end = abs(y[-1] - y[0])
+    mono_score = end_to_end / total_var
+
+    i_peak = int(np.argmax(y))
+    i_valley = int(np.argmin(y))
+    interior_peak = (0 < i_peak < len(y) - 1)
+    interior_valley = (0 < i_valley < len(y) - 1)
+
+    if mono_score < MONO_SCORE_THRESH and (interior_peak or interior_valley):
+        return False
+
+    return True
+
+
+def knife_from_monotonic_power(p_s):
+    left, right = robust_edge_levels(p_s)
+
+    P = (p_s - left) / (right - left + 1e-12)
+    P = np.clip(P, 0.0, 1.0)
+
+    k = max(3, len(P) // 10)
+    if np.mean(P[:k]) < np.mean(P[-k:]):
+        P = 1.0 - P
+
+    P = moving_average(P, MA_W_P)
+    P = np.clip(P, 0.0, 1.0)
+    return P
+
+
+def profile_from_hump_power(x_mm, p_s):
+    left, right = robust_edge_levels(p_s)
+    baseline = min(left, right)
+
+    prof = p_s - baseline
+    prof = np.maximum(prof, 0.0)
+    prof = moving_average(prof, MA_W_D)
+    prof = np.maximum(prof, 0.0)
+
+    if np.max(prof) > 0:
+        prof = np.where(prof >= 0.03 * np.max(prof), prof, 0.0)
+
+    dx = float(np.median(np.diff(x_mm)))
+    P_rise = np.cumsum(prof) * dx
+    P_rise = normalize_01(P_rise)
+
+    P = 1.0 - P_rise
+    P = moving_average(P, MA_W_P)
+    P = np.clip(P, 0.0, 1.0)
+
+    return P, prof
+
+
+def crossing_x_at_level(x, y, level=0.5):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if len(x) < 2:
+        return 0.0
+
+    s = y - level
+    idx = np.where(np.signbit(s[:-1]) != np.signbit(s[1:]))[0]
+    if len(idx) == 0:
+        return float(x[np.argmin(np.abs(s))])
+
+    i = idx[0]
+    x0, x1 = x[i], x[i + 1]
+    y0, y1 = y[i], y[i + 1]
+
+    if abs(y1 - y0) < 1e-12:
+        return float(x0)
+
+    return float(x0 + (level - y0) * (x1 - x0) / (y1 - y0))
+
+
+def weighted_stats_from_profile(x, prof):
+    x = np.asarray(x, dtype=float)
+    prof = np.asarray(prof, dtype=float)
+
+    prof = np.maximum(prof, 0.0)
+    s = float(np.sum(prof))
+    if s <= 0 or len(x) < 3:
+        return None, None, None
+
+    mu = float(np.sum(x * prof) / s)
+    var = float(np.sum(prof * (x - mu) ** 2) / s)
+    sigma = float(np.sqrt(max(var, 0.0)))
+    width_4sigma = 4.0 * sigma
+    return mu, sigma, width_4sigma
+
+
+def crop_main_lobe(x, profile, half_win_mm=PROFILE_HALF_WIN_MM, thresh_frac=PROFILE_THRESH_FRAC):
+    x = np.asarray(x, dtype=float)
+    profile = np.asarray(profile, dtype=float)
+
+    if len(x) < 5:
+        return x, profile
+
+    profile = np.maximum(profile, 0.0)
+    i_peak = int(np.argmax(profile))
+    x_peak = x[i_peak]
+    p_peak = profile[i_peak]
+
+    if p_peak <= 0:
+        return x, profile
+
+    keep = (x >= (x_peak - half_win_mm)) & (x <= (x_peak + half_win_mm))
+    x_c = x[keep]
+    p_c = profile[keep]
+
+    if len(x_c) < 5:
+        return x, profile
+
+    thresh = thresh_frac * np.max(p_c)
+    p_c = np.where(p_c >= thresh, p_c, 0.0)
+    return x_c, p_c
+
+
+def process_scan(t_ms, deg, p_mw, v=None):
+    t_ms = np.asarray(t_ms, dtype=float)
+    deg = np.asarray(deg, dtype=float)
+    p_mw = np.asarray(p_mw, dtype=float)
+
+    if len(t_ms) < 10:
+        return None
+
+    t_s = (t_ms - t_ms[0]) / 1000.0
+    theta_rad = np.deg2rad(deg - deg[0])
+    x_mm = R_MM * theta_rad
+
+    order = np.argsort(x_mm)
+    x_mm = x_mm[order]
+    t_s = t_s[order]
+    deg = deg[order]
+    p_mw = p_mw[order]
+
+    if v is None or len(v) != len(p_mw):
+        v_s = p_mw.copy()
+    else:
+        v_s = moving_average(np.asarray(v, dtype=float)[order], MA_W_V)
+
+    # p_s = moving_average(p_mw, MA_W_P)
+    p_s = p_mw.copy()
+
+    if len(x_mm) < 3:
+        return None
+
+    dx = float(np.median(np.diff(x_mm)))
+    if abs(dx) < 1e-12:
+        return None
+
+    # Force profile-integrated mode for now
+    monotonic_mode = False
+
+    if monotonic_mode:
+        P = knife_from_monotonic_power(p_s)
+        dPdx = np.gradient(P, dx)
+        profile_full = -dPdx
+        profile_full = profile_full - np.min(profile_full)
+        profile_full = np.maximum(profile_full, 0.0)
+        profile_full = moving_average(profile_full, MA_W_D)
+        profile_full = np.maximum(profile_full, 0.0)
+    else:
+        P, profile_full = profile_from_hump_power(x_mm, p_s)
+
+    if np.max(profile_full) > 0:
+        profile_full = np.where(profile_full >= 0.04 * np.max(profile_full), profile_full, 0.0)
+
+    x_prof, profile = crop_main_lobe(x_mm, profile_full)
+    mu, sigma, width_4sigma = weighted_stats_from_profile(x_prof, profile)
+
+    x_center = crossing_x_at_level(x_mm, P, 0.5)
+    x_mm_rel = x_mm - x_center
+
+    if mu is not None:
+        x_prof_centered = x_prof - mu
+    else:
+        x_prof_centered = x_prof - x_center
+
+    return {
+        "t_s": t_s,
+        "x_mm": x_mm_rel,
+        "deg": deg,
+        "v_s": v_s,
+        "p_mw": p_s,
+        "P": P,
+        "profile_full": profile_full,
+        "x_prof": x_prof_centered,
+        "profile": profile,
+        "mu": mu,
+        "sigma": sigma,
+        "width_4sigma": width_4sigma,
+        "x_center": x_center,
+        "mode": "knife_edge" if monotonic_mode else "profile_integrated",
+    }
+
+
+def average_processed_scans(results):
+    if not results:
+        return None
+    if len(results) == 1:
+        return results[0]
+
+    x0 = max(r["x_mm"][0] for r in results)
+    x1 = min(r["x_mm"][-1] for r in results)
+    if x1 <= x0:
+        return None
+
+    n = min(len(r["x_mm"]) for r in results)
+    x_common = np.linspace(x0, x1, n)
+
+    v_stack = []
+    p_stack = []
+    P_stack = []
+    prof_stack = []
+    t_stack = []
+
+    for r in results:
+        v_stack.append(np.interp(x_common, r["x_mm"], r["v_s"]))
+        p_stack.append(np.interp(x_common, r["x_mm"], r["p_mw"]))
+        P_stack.append(np.interp(x_common, r["x_mm"], r["P"]))
+        prof_stack.append(np.interp(x_common, r["x_mm"], r["profile_full"]))
+        t_stack.append(np.interp(x_common, r["x_mm"], r["t_s"]))
+
+    v_avg = np.mean(np.vstack(v_stack), axis=0)
+    p_avg = np.mean(np.vstack(p_stack), axis=0)
+    P_avg = np.mean(np.vstack(P_stack), axis=0)
+    prof_full_avg = np.mean(np.vstack(prof_stack), axis=0)
+    t_avg = np.mean(np.vstack(t_stack), axis=0)
+
+    x_prof, prof_avg = crop_main_lobe(x_common, prof_full_avg)
+    mu, sigma, width_4sigma = weighted_stats_from_profile(x_prof, prof_avg)
+    x_prof_centered = x_prof - mu if mu is not None else x_prof
+
+    return {
+        "t_s": t_avg,
+        "x_mm": x_common,
+        "deg": None,
+        "v_s": v_avg,
+        "p_mw": p_avg,
+        "P": P_avg,
+        "profile_full": prof_full_avg,
+        "x_prof": x_prof_centered,
+        "profile": prof_avg,
+        "mu": mu,
+        "sigma": sigma,
+        "width_4sigma": width_4sigma,
+        "x_center": 0.0,
+        "mode": "avg",
+    }
+
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def save_raw_scan_csv(scan, out_csv):
+    n = len(scan["t_ms"])
+    data = np.column_stack((
+        np.full(n, scan["axis"], dtype=int),
+        np.full(n, scan["scan_no"], dtype=int),
+        np.arange(n, dtype=int),
+        scan["t_ms"],
+        scan["deg"],
+        scan["stage"],
+        scan["raw"],
+        scan["v"],
+        scan["p_mw"],
+    ))
+    np.savetxt(
+        out_csv,
+        data,
+        delimiter=",",
+        header="axis,scan_no,point_idx,t_ms,deg,stage,raw,v,p_mw",
+        comments="",
+        fmt=["%d", "%d", "%d", "%.6f", "%.6f", "%d", "%d", "%.6f", "%.6f"],
+    )
+
+
+def save_processed_scan_csv(axis, scan_no, result, out_csv):
+    n1 = len(result["x_mm"])
+    n2 = len(result["x_prof"])
+    with open(out_csv, "w", encoding="utf-8") as f:
+        f.write(f"# axis,{axis}\n")
+        f.write(f"# scan_no,{scan_no}\n")
+        f.write(f"# mode,{result['mode']}\n")
+        f.write(f"# sigma_mm,{result['sigma']}\n")
+        f.write(f"# width_4sigma_mm,{result['width_4sigma']}\n")
+        f.write("x_mm,v_s,p_mw_smooth,P,profile_x_mm,beam_profile\n")
+        for i in range(max(n1, n2)):
+            c1 = c2 = c3 = c4 = c5 = c6 = ""
+            if i < n1:
+                c1 = f"{result['x_mm'][i]:.6f}"
+                c2 = f"{result['v_s'][i]:.6f}"
+                c3 = f"{result['p_mw'][i]:.6f}"
+                c4 = f"{result['P'][i]:.6f}"
+            if i < n2:
+                c5 = f"{result['x_prof'][i]:.6f}"
+                c6 = f"{result['profile'][i]:.6f}"
+            f.write(f"{c1},{c2},{c3},{c4},{c5},{c6}\n")
+
+
+def save_scan_plots(axis, scan_no, result, out_dir, t0_info=None):
+    axis_label = axis + 1
+
+    fig1, ax1 = plt.subplots()
+    ax1.plot(result["x_mm"], result["p_mw"], label="Power (mW)")
+    ax1.plot(result["x_mm"], result["P"], label="Normalized knife-edge")
+    add_t0_overlay(ax1, t0_info, axis="x")
+    ax1.set_xlabel("Position x (mm)")
+    ax1.set_ylabel("Power / normalized power")
+    ax1.set_title(f"Axis {axis_label} Scan {scan_no} - Knife-edge / Power")
+    ax1.grid(True)
+    ax1.legend()
+    if result["sigma"] is not None:
+        ax1.text(
+            0.02, 0.98,
+            f"σ = {result['sigma']:.3f} mm\n"
+            f"4σ = {result['width_4sigma']:.3f} mm\n"
+            f"mode = {result['mode']}",
+            transform=ax1.transAxes,
+            va="top", ha="left"
+        )
+    fig1.savefig(
+        os.path.join(out_dir, f"axis{axis_label}_scan{scan_no}_knifeedge.png"),
+        dpi=200, bbox_inches="tight"
+    )
+    plt.close(fig1)
+
+    fig2, ax2 = plt.subplots()
+    ax2.plot(result["x_prof"], result["profile"], label="Beam profile")
+    if t0_info is not None:
+        ax2.axvline(0.0, linestyle="--", linewidth=2, label="Beam center ref")
+    ax2.set_xlabel("Position relative to centroid (mm)")
+    ax2.set_ylabel("Profile amplitude")
+    ax2.set_title(f"Axis {axis_label} Scan {scan_no} - Beam Profile")
+    ax2.grid(True)
+    ax2.legend()
+    if result["sigma"] is not None:
+        ax2.text(
+            0.02, 0.98,
+            f"σ = {result['sigma']:.3f} mm\n"
+            f"4σ = {result['width_4sigma']:.3f} mm",
+            transform=ax2.transAxes,
+            va="top", ha="left"
+        )
+    fig2.savefig(
+        os.path.join(out_dir, f"axis{axis_label}_scan{scan_no}_profile.png"),
+        dpi=200, bbox_inches="tight"
+    )
+    plt.close(fig2)
+
+
+def save_initial_t0_scan_plot(axis, scan0, t0_info, out_dir, smooth_win=9):
+    if scan0 is None:
+        return
+
+    axis_label = axis + 1
+
+    t_ms = np.asarray(scan0["t_ms"], dtype=float)
+    deg = np.asarray(scan0["deg"], dtype=float)
+    p_mw = np.asarray(scan0["p_mw"], dtype=float)
+
+    if len(t_ms) < 3:
+        return
+
+    theta_deg = deg - deg[0]
+    theta_rad = np.deg2rad(theta_deg)
+    x_mm = R_MM * theta_rad
+
+    smooth_win = max(1, int(smooth_win))
+    if smooth_win % 2 == 0:
+        smooth_win += 1
+
+    kernel = np.ones(smooth_win, dtype=float) / smooth_win
+    p_smooth = np.convolve(p_mw, kernel, mode="same")
+
+    if len(x_mm) >= 3 and np.all(np.diff(x_mm) != 0):
+        dpdx = np.gradient(p_smooth) / np.gradient(x_mm)
+        abs_dpdx = np.abs(dpdx)
+    else:
+        abs_dpdx = np.zeros_like(p_smooth)
+
+    x_t0 = None
+    deg_t0 = None
+    t0_ms = None
+    p_t0 = None
+
+    if t0_info_by_axis is not None:
+        x_t0 = t0_info["x_mm"]
+        deg_t0 = t0_info["deg"]
+        t0_ms = t0_info["t_ms"]
+        p_t0 = t0_info.get("p_mw", None)
+
+    fig, axs = plt.subplots(3, 1, figsize=(10, 12))
+
+    # Plot 1: like first script, power vs angle
+    axs[0].plot(theta_deg, p_mw, label="Power (mW)")
+    axs[0].plot(theta_deg, p_smooth, label="Smoothed Power")
+    if deg_t0 is not None:
+        axs[0].axvline(deg_t0, linestyle="--", linewidth=2,
+                       label=f"STM32 T0 = {deg_t0:.3f} deg")
+    axs[0].set_xlabel("Angle (deg)")
+    axs[0].set_ylabel("Power (mW)")
+    axs[0].set_title(f"Axis {axis_label} Initial Scan 0 - Power vs Angle")
+    axs[0].grid(True)
+    axs[0].legend()
+
+    # Plot 2: like first script, power vs position
+    axs[1].plot(x_mm, p_mw, label="Power (mW)")
+    axs[1].plot(x_mm, p_smooth, label="Smoothed Power")
+    if x_t0 is not None:
+        axs[1].axvline(x_t0, linestyle="--", linewidth=2,
+                       label=f"STM32 T0 = {x_t0:.3f} mm")
+        if p_t0 is not None:
+            axs[1].plot(x_t0, p_t0, "ro", label="STM32 T0 point")
+    axs[1].set_xlabel("Position (mm)")
+    axs[1].set_ylabel("Power (mW)")
+    axs[1].set_title(f"Axis {axis_label} Initial Scan 0 - Power vs Position")
+    axs[1].grid(True)
+    axs[1].legend()
+
+    # Plot 3: derivative vs position
+    axs[2].plot(x_mm, abs_dpdx, label="|dP/dx|")
+    if x_t0 is not None:
+        axs[2].axvline(x_t0, linestyle="--", linewidth=2,
+                       label=f"STM32 T0 = {x_t0:.3f} mm")
+    axs[2].set_xlabel("Position (mm)")
+    axs[2].set_ylabel("Absolute derivative")
+    axs[2].set_title(f"Axis {axis_label} Initial Scan 0 - Derivative vs Position")
+    axs[2].grid(True)
+    axs[2].legend()
+
+    if t0_info is not None:
+        txt = (
+            f"T0 index = {t0_info.get('idx', 'N/A')}\n"
+            f"T0 = {t0_ms:.3f} ms\n"
+            f"T0 = {deg_t0:.3f} deg\n"
+            f"T0 = {x_t0:.3f} mm"
+        )
+        if p_t0 is not None:
+            txt += f"\nT0 power = {p_t0:.6f} mW"
+
+        axs[1].text(
+            0.02, 0.98,
+            txt,
+            transform=axs[1].transAxes,
+            va="top", ha="left"
+        )
+
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(out_dir, f"axis{axis_label}_initial_scan0_t0.png"),
+        dpi=200, bbox_inches="tight"
+    )
+    plt.close(fig)
+    
+def popup_initial_t0_scan(axis, scan0, t0_info, smooth_win=9):
+    if scan0 is None:
+        return
+
+    axis_label = axis + 1
+
+    t_ms = np.asarray(scan0["t_ms"], dtype=float)
+    deg = np.asarray(scan0["deg"], dtype=float)
+    p_mw = np.asarray(scan0["p_mw"], dtype=float)
+
+    theta_deg = deg - deg[0]
+    theta_rad = np.deg2rad(theta_deg)
+    x_mm = R_MM * theta_rad
+
+    smooth_win = max(1, int(smooth_win))
+    if smooth_win % 2 == 0:
+        smooth_win += 1
+
+    kernel = np.ones(smooth_win, dtype=float) / smooth_win
+    p_smooth = np.convolve(p_mw, kernel, mode="same")
+
+    if len(x_mm) >= 3 and np.all(np.diff(x_mm) != 0):
+        dpdx = np.gradient(p_smooth) / np.gradient(x_mm)
+        abs_dpdx = np.abs(dpdx)
+    else:
+        abs_dpdx = np.zeros_like(p_smooth)
+
+    x_t0 = t0_info["x_mm"] if t0_info is not None else None
+    deg_t0 = t0_info["deg"] if t0_info is not None else None
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(x_mm, p_mw, label="Initial scan power (raw)")
+    plt.plot(x_mm, p_smooth, label="Initial scan power (smoothed)")
+    if x_t0 is not None:
+        plt.axvline(x_t0, linestyle="--", linewidth=2,
+                    label=f"T0 = {x_t0:.3f} mm")
+    plt.xlabel("Position (mm)")
+    plt.ylabel("Power (mW)")
+    plt.title(f"Axis {axis_label} Initial Scan 0 - T0 on Raw Data")
+    plt.grid(True)
+    plt.legend()
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(x_mm, abs_dpdx, label="|dP/dx| from initial scan")
+    if x_t0 is not None:
+        plt.axvline(x_t0, linestyle="--", linewidth=2,
+                    label=f"T0 = {x_t0:.3f} mm")
+    plt.xlabel("Position (mm)")
+    plt.ylabel("Absolute derivative")
+    plt.title(f"Axis {axis_label} Initial Scan 0 - Derivative")
+    plt.grid(True)
+    plt.legend()
+
+def save_axis_combined_raw_csv(axis, raw_scans, out_csv):
+    with open(out_csv, "w", encoding="utf-8") as f:
+        f.write("axis,scan_no,point_idx,t_ms,deg,stage,raw,v,p_mw\n")
+        for scan in raw_scans:
+            n = len(scan["t_ms"])
+            for i in range(n):
+                f.write(
+                    f"{scan['axis']},{scan['scan_no']},{i},"
+                    f"{scan['t_ms'][i]:.6f},{scan['deg'][i]:.6f},"
+                    f"{scan['stage'][i]},{scan['raw'][i]},"
+                    f"{scan['v'][i]:.6f},{scan['p_mw'][i]:.6f}\n"
+                )
+
+
+def save_average_csv(axis, avg_result, out_csv):
+    n1 = len(avg_result["x_mm"])
+    n2 = len(avg_result["x_prof"])
+    with open(out_csv, "w", encoding="utf-8") as f:
+        f.write(f"# axis,{axis}\n")
+        f.write(f"# mode,{avg_result['mode']}\n")
+        f.write(f"# sigma_mm,{avg_result['sigma']}\n")
+        f.write(f"# width_4sigma_mm,{avg_result['width_4sigma']}\n")
+        f.write(f"# mu_mm,{avg_result['mu']}\n")
+        f.write("x_mm,v_s,p_mw_smooth,P,profile_x_mm,beam_profile\n")
+        for i in range(max(n1, n2)):
+            c1 = c2 = c3 = c4 = c5 = c6 = ""
+            if i < n1:
+                c1 = f"{avg_result['x_mm'][i]:.6f}"
+                c2 = f"{avg_result['v_s'][i]:.6f}"
+                c3 = f"{avg_result['p_mw'][i]:.6f}"
+                c4 = f"{avg_result['P'][i]:.6f}"
+            if i < n2:
+                c5 = f"{avg_result['x_prof'][i]:.6f}"
+                c6 = f"{avg_result['profile'][i]:.6f}"
+            f.write(f"{c1},{c2},{c3},{c4},{c5},{c6}\n")
+
+
+def save_average_plots(axis, avg_result, out_dir, t0_info=None):
+    axis_label = axis + 1
+
+    fig1, ax1 = plt.subplots()
+    ax1.plot(avg_result["x_mm"], avg_result["p_mw"], label="Average power (mW)")
+    ax1.plot(avg_result["x_mm"], avg_result["P"], label="Average normalized knife-edge")
+    add_t0_overlay(ax1, t0_info, axis="x")
+    ax1.set_xlabel("Position x (mm)")
+    ax1.set_ylabel("Power / normalized power")
+    ax1.set_title(f"Axis {axis_label} Average - Knife-edge / Power")
+    ax1.grid(True)
+    ax1.legend()
+    if avg_result["sigma"] is not None:
+        ax1.text(
+            0.02, 0.98,
+            f"σ = {avg_result['sigma']:.3f} mm\n"
+            f"4σ = {avg_result['width_4sigma']:.3f} mm\n"
+            f"mode = {avg_result['mode']}",
+            transform=ax1.transAxes,
+            va="top", ha="left"
+        )
+    fig1.savefig(
+        os.path.join(out_dir, f"axis{axis_label}_average_knifeedge.png"),
+        dpi=200, bbox_inches="tight"
+    )
+    plt.close(fig1)
+
+    fig2, ax2 = plt.subplots()
+    ax2.plot(avg_result["x_prof"], avg_result["profile"], label="Average beam profile")
+    ax2.set_xlabel("Position relative to centroid (mm)")
+    ax2.set_ylabel("Profile amplitude")
+    ax2.set_title(f"Axis {axis_label} Average - Beam Profile")
+    ax2.grid(True)
+    ax2.legend()
+    if avg_result["sigma"] is not None:
+        ax2.text(
+            0.02, 0.98,
+            f"σ = {avg_result['sigma']:.3f} mm\n"
+            f"4σ = {avg_result['width_4sigma']:.3f} mm",
+            transform=ax2.transAxes,
+            va="top", ha="left"
+        )
+    fig2.savefig(
+        os.path.join(out_dir, f"axis{axis_label}_average_profile.png"),
+        dpi=200, bbox_inches="tight"
+    )
+    plt.close(fig2)
+
+
+def popup_average_only(axis, avg_result, t0_info=None):
+    axis_label = axis + 1
+
+    txt1 = ""
+    txt2 = ""
+
+    if avg_result["sigma"] is not None:
+        txt1 += (
+            f"σ = {avg_result['sigma']:.3f} mm\n"
+            f"4σ = {avg_result['width_4sigma']:.3f} mm\n"
+            f"mode = {avg_result['mode']}"
+        )
+        txt2 += (
+            f"σ = {avg_result['sigma']:.3f} mm\n"
+            f"4σ = {avg_result['width_4sigma']:.3f} mm"
+        )
+
+    if t0_info is not None:
+        if txt1:
+            txt1 += "\n"
+        if txt2:
+            txt2 += "\n"
+        txt1 += f"T0 = {t0_info['x_mm']:.3f} mm ({t0_info['deg']:.3f} deg)"
+        txt2 += f"T0 = {t0_info['x_mm']:.3f} mm ({t0_info['deg']:.3f} deg)"
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(avg_result["x_mm"], avg_result["p_mw"], label="Average power (mW, smoothed)")
+    plt.plot(avg_result["x_mm"], avg_result["P"], label="Average normalized knife-edge")
+    add_t0_overlay(plt.gca(), t0_info, axis="x")
+    plt.xlabel("Position x (mm)")
+    plt.ylabel("Power / normalized power")
+    plt.title(f"Axis {axis_label} Average - Knife-edge / Power")
+    plt.grid(True)
+    plt.legend()
+    if txt1:
+        plt.text(
+            0.02, 0.98,
+            txt1,
+            transform=plt.gca().transAxes,
+            va="top", ha="left"
+        )
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(avg_result["x_prof"], avg_result["profile"], label="Average beam profile")
+    plt.xlabel("Position relative to centroid (mm)")
+    plt.ylabel("Profile amplitude")
+    plt.title(f"Axis {axis_label} Average - Beam Profile")
+    plt.grid(True)
+    plt.legend()
+    if txt2:
+        plt.text(
+            0.02, 0.98,
+            txt2,
+            transform=plt.gca().transAxes,
+            va="top", ha="left"
+        )
+
+
+# ============================================================
+# Main acquisition
+# ============================================================
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_dir = os.path.join(SAVE_ROOT, f"profile_run_{timestamp}")
+ensure_dir(run_dir)
+
+ser = serial.Serial(PORT, BAUD, timeout=SERIAL_TIMEOUT_S)
+ser.reset_input_buffer()
+ser.reset_output_buffer()
+
+print(f"Opening {PORT} @ {BAUD}")
+print(f"Sending command: {START_CMD.decode().strip()}")
+ser.write(START_CMD)
+
+# Metadata from STM32 prints
+profile_begin_by_axis = {0: {}, 1: {}}
+profile_t0_by_axis = {0: {}, 1: {}}
+t0_info_by_axis = {0: None, 1: None}
+
+# Raw repeated scans grouped by axis
+raw_scans_all = {0: [], 1: []}
+processed_scans_all = {0: [], 1: []}
+
+initial_scan0_by_axis = {0: None, 1: None}
+
+# Current in-progress scan
+cur_axis = None
+cur_scan_no = None
+cur_t_ms = []
+cur_deg = []
+cur_stage = []
+cur_raw = []
+cur_v = []
+cur_p_mw = []
+
+profile_done = False
+empty_count = 0
+
+
+def finalize_current_scan():
+    global cur_axis, cur_scan_no, cur_t_ms, cur_deg, cur_stage, cur_raw, cur_v, cur_p_mw
+    global initial_scan0_by_axis
+
+    if cur_axis is None or cur_scan_no is None or len(cur_t_ms) == 0:
+        cur_axis = None
+        cur_scan_no = None
+        cur_t_ms = []
+        cur_deg = []
+        cur_stage = []
+        cur_raw = []
+        cur_v = []
+        cur_p_mw = []
+        return
+
+    scan = {
+        "axis": cur_axis,
+        "scan_no": cur_scan_no,
+        "t_ms": np.array(cur_t_ms, dtype=float),
+        "deg": np.array(cur_deg, dtype=float),
+        "stage": np.array(cur_stage, dtype=int),
+        "raw": np.array(cur_raw, dtype=int),
+        "v": np.array(cur_v, dtype=float),
+        "p_mw": np.array(cur_p_mw, dtype=float),
+    }
+
+    # KEEP scan 0 so we can plot where T0 was found from the initial scan
+    if cur_scan_no == 0:
+        initial_scan0_by_axis[cur_axis] = scan
+
+    # Keep existing repeated scan handling
+    if REPEATED_SCAN_MIN <= cur_scan_no <= REPEATED_SCAN_MAX:
+        raw_scans_all[cur_axis].append(scan)
+
+        result = process_scan(scan["t_ms"], scan["deg"], scan["p_mw"], scan["v"])
+        if result is not None:
+            processed_scans_all[cur_axis].append({
+                "scan_no": cur_scan_no,
+                "result": result
+            })
+
+    cur_axis = None
+    cur_scan_no = None
+    cur_t_ms = []
+    cur_deg = []
+    cur_stage = []
+    cur_raw = []
+    cur_v = []
+    cur_p_mw = []
+
+
+while not profile_done:
+    line = ser.readline().decode(errors="ignore").strip()
+
+    if not line:
+        empty_count += 1
+        if empty_count > EMPTY_LIMIT:
+            print("Timed out waiting for STM32 profile output.")
+            break
+        continue
+
+    empty_count = 0
+    print(line)
+
+    if line == "BM_DONE":
+        finalize_current_scan()
+        continue
+
+    if line.startswith("PROFILE_DONE"):
+        finalize_current_scan()
+        profile_done = True
+        continue
+
+    if line.startswith("PROFILE_ABORT"):
+        finalize_current_scan()
+        break
+
+    if line.startswith("PROFILE_BEGIN"):
+        kv = parse_keyvals(line)
+        axis = safe_int(kv, "axis", None)
+        if axis in (0, 1):
+            profile_begin_by_axis[axis] = kv
+        continue
+
+    if line.startswith("PROFILE_T0"):
+        kv = parse_keyvals(line)
+        axis = safe_int(kv, "axis", None)
+        if axis in (0, 1):
+            profile_t0_by_axis[axis] = kv
+        continue
+
+    if line.startswith("PROFILE_TIMING") or line.startswith("PROFILE_SCAN_") or line.startswith("PROFILE_AXIS_DONE"):
+        continue
+
+    bm = parse_bm(line)
+    if bm is None:
+        continue
+
+    axis = bm["axis"]
+    scan_no = bm["scan"]
+
+    if cur_axis is None:
+        cur_axis = axis
+        cur_scan_no = scan_no
+    elif axis != cur_axis or scan_no != cur_scan_no:
+        finalize_current_scan()
+        cur_axis = axis
+        cur_scan_no = scan_no
+
+    cur_t_ms.append(bm["t_ms"])
+    cur_deg.append(bm["deg"])
+    cur_stage.append(bm["stage"])
+    cur_raw.append(bm["raw"])
+    cur_v.append(bm["v"])
+    cur_p_mw.append(bm["p_mw"])
+
+ser.close()
+
+# ============================================================
+# Compute and print T0 per axis from STM32 metadata
+# ============================================================
+for axis in (0, 1):
+    begin_kv = profile_begin_by_axis[axis]
+    t0_kv = profile_t0_by_axis[axis]
+
+    omega = safe_float(begin_kv, "omega", None)
+    t0_s = safe_float(t0_kv, "t0_s", None)
+    t0_ms = safe_float(t0_kv, "t0_ms", None)
+    t0_idx = safe_int(t0_kv, "idx", None)
+    t0_p_mw = safe_float(t0_kv, "p_mw", None)
+
+    if t0_ms is not None:
+        t0_s_calc = t0_ms / 1000.0
+    elif t0_s is not None:
+        t0_s_calc = t0_s
+    else:
+        t0_s_calc = None
+
+    if omega is not None and t0_s_calc is not None:
+        t0_deg = np.degrees(omega * t0_s_calc)
+        t0_x_mm = R_MM * omega * t0_s_calc
+
+        t0_info_by_axis[axis] = {
+            "idx": t0_idx,
+            "t_s": t0_s_calc,
+            "t_ms": t0_s_calc * 1000.0,
+            "deg": t0_deg,
+            "x_mm": t0_x_mm,
+            "p_mw": t0_p_mw,
+        }
+
+        print(f"\n=== AXIS {axis + 1} T0 ===")
+        if t0_idx is not None:
+            print(f"T0 index:         {t0_idx}")
+        print(f"T0 time (s):      {t0_s_calc:.6f}")
+        print(f"T0 time (ms):     {t0_s_calc * 1000.0:.3f}")
+        print(f"T0 angle (deg):   {t0_deg:.3f}")
+        print(f"T0 position (mm): {t0_x_mm:.4f}")
+        if t0_p_mw is not None:
+            print(f"T0 power (mW):    {t0_p_mw:.6f}")
+    else:
+        print(f"\n=== AXIS {axis + 1} T0 ===")
+        print("T0 information not available from STM32 prints.")
+        
+# ============================================================
+# Save / show initial scan 0 T0 plots
+# ============================================================
+for axis in (0, 1):
+    axis_label = axis + 1
+    axis_dir = os.path.join(run_dir, f"axis_{axis_label}")
+    ensure_dir(axis_dir)
+
+    scan0 = initial_scan0_by_axis[axis]
+    t0_info = t0_info_by_axis[axis]
+
+    if scan0 is not None:
+        save_raw_scan_csv(
+            scan0,
+            os.path.join(axis_dir, f"axis{axis_label}_initial_scan0_raw.csv")
+        )
+
+        save_initial_t0_scan_plot(
+            axis=axis,
+            scan0=scan0,
+            t0_info=t0_info,
+            out_dir=axis_dir,
+            smooth_win=9
+        )
+
+# ============================================================
+# Save everything
+# ============================================================
+for axis in (0, 1):
+    axis_label = axis + 1
+    axis_dir = os.path.join(run_dir, f"axis_{axis_label}")
+    ensure_dir(axis_dir)
+
+    raw_scans = raw_scans_all[axis]
+    proc_scans = processed_scans_all[axis]
+
+    print(f"\nAxis {axis_label}: captured {len(raw_scans)} repeated scans")
+
+    if raw_scans:
+        save_axis_combined_raw_csv(
+            axis,
+            raw_scans,
+            os.path.join(axis_dir, f"axis{axis_label}_all_raw_scans.csv")
+        )
+
+    proc_by_scan = {item["scan_no"]: item["result"] for item in proc_scans}
+
+    for scan in raw_scans:
+        scan_no = int(scan["scan_no"])
+
+        save_raw_scan_csv(
+            scan,
+            os.path.join(axis_dir, f"axis{axis_label}_scan{scan_no}_raw.csv")
+        )
+
+        if scan_no in proc_by_scan:
+            result = proc_by_scan[scan_no]
+
+            save_processed_scan_csv(
+                axis,
+                scan_no,
+                result,
+                os.path.join(axis_dir, f"axis{axis_label}_scan{scan_no}_processed.csv")
+            )
+
+            save_scan_plots(axis, scan_no, result, axis_dir, t0_info_by_axis[axis])
+
+    only_results = [item["result"] for item in proc_scans]
+    avg_result = average_processed_scans(only_results)
+
+    if avg_result is not None:
+        save_average_csv(
+            axis,
+            avg_result,
+            os.path.join(axis_dir, f"axis{axis_label}_average.csv")
+        )
+
+        save_average_plots(axis, avg_result, axis_dir)
+
+        print(
+            f"Axis {axis_label} average: "
+            f"sigma = {avg_result['sigma']:.6f} mm, "
+            f"4sigma width = {avg_result['width_4sigma']:.6f} mm"
+        )
+
+        if t0_info_by_axis[axis] is not None:
+            print(
+                f"Axis {axis_label} T0 summary: "
+                f"x = {t0_info_by_axis[axis]['x_mm']:.4f} mm, "
+                f"theta = {t0_info_by_axis[axis]['deg']:.3f} deg"
+            )
+
+        popup_average_only(axis, avg_result, t0_info=t0_info_by_axis[axis])
+    else:
+        print(f"Axis {axis_label}: no valid average result")
+
+print(f"\nSaved all data to: {run_dir}")
+plt.show()

@@ -1,0 +1,238 @@
+import os
+from datetime import datetime
+
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+
+PORT = "COM7"         # change to your STM32 USB CDC COM port
+BAUD = 115200
+CMD  = b"T0M1\n"      # or b"T0M2\n"
+
+SAVE_DIR = "t0_erf_runs"
+
+ser = serial.Serial(PORT, BAUD, timeout=1)
+
+# Storage
+axis_vals = []
+idx_vals = []
+t_ms_vals = []
+raw_p_vals = []
+fit_p_vals = []
+dfit_vals = []
+
+t0_ms = None
+t0_idx = None
+fit_x0_idx = None
+fit_w_idx = None
+fit_ylo = None
+fit_yhi = None
+axis_reported = None
+
+capture_started = False
+capture_done = False
+
+
+def parse_keyvals(line: str):
+    """
+    Parses lines like:
+    T0_RESULT,axis=0,idx=123,t0_ms=45.6,V=1.2,P=3.4,stage=2
+    Returns dict of key->value as strings.
+    """
+    out = {}
+    parts = line.strip().split(",")
+    for p in parts[1:]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+print(f"Opening {PORT} @ {BAUD}")
+ser.reset_input_buffer()
+ser.reset_output_buffer()
+
+print(f"Sending command: {CMD.decode().strip()}")
+ser.write(CMD)
+
+empty_count = 0
+
+while not capture_done:
+    line = ser.readline().decode(errors="ignore").strip()
+
+    if not line:
+        empty_count += 1
+        if empty_count > 50:
+            print("Timed out waiting for data.")
+            break
+        continue
+
+    empty_count = 0
+    print(line)
+
+    if line.startswith("T0_RESULT"):
+        kv = parse_keyvals(line)
+        axis_reported = int(kv.get("axis", "0"))
+        t0_idx = int(float(kv.get("idx", "0")))
+        t0_ms = float(kv.get("t0_ms", "0"))
+
+    elif line.startswith("T0_FIT"):
+        kv = parse_keyvals(line)
+        fit_x0_idx = float(kv.get("x0_idx", "0"))
+        fit_w_idx  = float(kv.get("w_idx", "0"))
+        fit_ylo    = float(kv.get("ylo", "0"))
+        fit_yhi    = float(kv.get("yhi", "0"))
+
+    elif line.startswith("T0_RAW_BEGIN"):
+        capture_started = True
+
+    elif line.startswith("RAW,"):
+        parts = line.split(",")
+        if len(parts) != 7:
+            continue
+
+        try:
+            axis_vals.append(int(parts[1]))
+            idx_vals.append(int(parts[2]))
+            t_ms_vals.append(float(parts[3]))
+            raw_p_vals.append(float(parts[4]))
+            fit_p_vals.append(float(parts[5]))
+            dfit_vals.append(float(parts[6]))
+        except ValueError:
+            continue
+
+    elif line.startswith("T0_RAW_DONE"):
+        capture_done = True
+
+ser.close()
+
+if len(t_ms_vals) == 0:
+    print("No RAW samples captured.")
+    raise SystemExit
+
+# Convert to numpy
+axis_vals = np.array(axis_vals, dtype=int)
+idx_vals  = np.array(idx_vals, dtype=int)
+t_ms_vals = np.array(t_ms_vals, dtype=float)
+raw_p_vals = np.array(raw_p_vals, dtype=float)
+fit_p_vals = np.array(fit_p_vals, dtype=float)
+dfit_vals  = np.array(dfit_vals, dtype=float)
+
+# Find derivative peak if T0_RESULT was missing
+if t0_idx is None:
+    t0_idx = int(np.argmax(np.abs(dfit_vals)))
+if t0_ms is None:
+    t0_ms = float(t_ms_vals[t0_idx])
+
+# Create save folder
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+axis_str = str(axis_reported if axis_reported is not None else axis_vals[0])
+base_name = os.path.join(SAVE_DIR, f"axis{axis_str}_erf_{timestamp}")
+
+# Summary
+print("\n--- Summary ---")
+print(f"Axis:         {axis_str}")
+print(f"Samples:      {len(t_ms_vals)}")
+print(f"T0 index:     {t0_idx}")
+print(f"T0 time (ms): {t0_ms:.6f}")
+
+if fit_x0_idx is not None:
+    print(f"Fit x0_idx:   {fit_x0_idx:.3f}")
+    print(f"Fit w_idx:    {fit_w_idx:.3f}")
+    print(f"Fit ylo:      {fit_ylo:.6f}")
+    print(f"Fit yhi:      {fit_yhi:.6f}")
+
+# Peak derivative info
+peak_i = int(np.argmax(np.abs(dfit_vals)))
+print(f"Peak |dfit| index: {peak_i}")
+print(f"Peak |dfit| time:  {t_ms_vals[peak_i]:.6f} ms")
+print(f"Peak |dfit| value: {dfit_vals[peak_i]:.6f}")
+
+# Save CSV
+csv_file = base_name + ".csv"
+
+header_lines = [
+    f"axis,{axis_str}",
+    f"samples,{len(t_ms_vals)}",
+    f"t0_idx,{t0_idx}",
+    f"t0_ms,{t0_ms}",
+]
+
+if fit_x0_idx is not None:
+    header_lines += [
+        f"fit_x0_idx,{fit_x0_idx}",
+        f"fit_w_idx,{fit_w_idx}",
+        f"fit_ylo,{fit_ylo}",
+        f"fit_yhi,{fit_yhi}",
+    ]
+
+header_lines.append("index,time_ms,raw_power_mW,erf_fit_power_mW,erf_fit_derivative")
+
+header_text = "\n".join(header_lines)
+
+data = np.column_stack((
+    np.arange(len(t_ms_vals)),
+    t_ms_vals,
+    raw_p_vals,
+    fit_p_vals,
+    dfit_vals
+))
+
+np.savetxt(
+    csv_file,
+    data,
+    delimiter=",",
+    header=header_text,
+    comments=""
+)
+
+print(f"Saved CSV -> {csv_file}")
+
+# Plot 1: raw power + erf fit
+plt.figure(figsize=(11, 6))
+plt.plot(t_ms_vals, raw_p_vals, label="Raw power (mW)")
+plt.plot(t_ms_vals, fit_p_vals, label="Erf fit power (mW)")
+plt.axvline(t0_ms, linestyle="--", label=f"T0 = {t0_ms:.3f} ms")
+plt.xlabel("Time (ms)")
+plt.ylabel("Power (mW)")
+plt.title("T0 Find: Raw Power and Error-Function Fit")
+plt.grid(True)
+plt.legend()
+
+plot1_file = base_name + "_power.png"
+plt.savefig(plot1_file, dpi=300, bbox_inches="tight")
+print(f"Saved plot -> {plot1_file}")
+
+# Plot 2: derivative of erf fit
+plt.figure(figsize=(11, 6))
+plt.plot(t_ms_vals, dfit_vals, label="d/dt of erf fit")
+plt.axvline(t0_ms, linestyle="--", label=f"T0 = {t0_ms:.3f} ms")
+plt.xlabel("Time (ms)")
+plt.ylabel("Derivative")
+plt.title("T0 Find: Derivative of Error-Function Fit")
+plt.grid(True)
+plt.legend()
+
+plot2_file = base_name + "_derivative.png"
+plt.savefig(plot2_file, dpi=300, bbox_inches="tight")
+print(f"Saved plot -> {plot2_file}")
+
+# Plot 3: overlay
+plt.figure(figsize=(12, 7))
+plt.plot(t_ms_vals, raw_p_vals, label="Raw power (mW)")
+plt.plot(t_ms_vals, fit_p_vals, label="Erf fit power (mW)")
+plt.plot(t_ms_vals, dfit_vals, label="Derivative of erf fit")
+plt.axvline(t0_ms, linestyle="--", label=f"T0 = {t0_ms:.3f} ms")
+plt.xlabel("Time (ms)")
+plt.ylabel("Signal")
+plt.title("T0 Find Overlay")
+plt.grid(True)
+plt.legend()
+
+plot3_file = base_name + "_overlay.png"
+plt.savefig(plot3_file, dpi=300, bbox_inches="tight")
+print(f"Saved plot -> {plot3_file}")
+
+plt.show()

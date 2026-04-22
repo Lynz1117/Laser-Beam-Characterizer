@@ -1,0 +1,110 @@
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+
+PORT = "COM3"
+BAUD = 115200
+
+ser = serial.Serial(PORT, BAUD, timeout=1)
+
+def moving_average(y, w=9):
+    y = np.asarray(y, dtype=float)
+    if y.size < w:
+        return y
+    if w % 2 == 0:
+        w += 1
+    k = np.ones(w) / w
+    return np.convolve(y, k, mode="same")
+
+def parse_bm(line):
+    line = line.strip()
+    if line == "BM_DONE":
+        return ("DONE",)
+    if not line.startswith("BM,"):
+        return None
+    p = line.split(",")
+    if len(p) < 4:
+        return None
+    try:
+        t_ms = int(p[1])
+        deg  = float(p[2])
+        v    = float(p[3])
+        return ("BM", t_ms, deg, v)
+    except ValueError:
+        return None
+
+print("Listening... waiting for one 0→180 scan (BM... then BM_DONE)")
+
+t_list, deg_list, v_list = [], [], []
+
+while True:
+    s = ser.readline().decode(errors="ignore")
+    if not s:
+        continue
+
+    msg = parse_bm(s)
+    if msg is None:
+        continue
+
+    if msg[0] == "DONE":
+        print("Scan complete.")
+        break
+
+    _, t_ms, deg, v = msg
+    t_list.append(t_ms)
+    deg_list.append(deg)
+    v_list.append(v)
+
+deg = np.asarray(deg_list, float)
+v   = np.asarray(v_list, float)
+
+# Sort by angle
+order = np.argsort(deg)
+deg = deg[order]
+v   = v[order]
+
+# If duplicates exist, average them
+deg_u, idx, counts = np.unique(deg, return_index=True, return_counts=True)
+v_sum = np.add.reduceat(v, idx)
+v_avg = v_sum / counts
+
+# Smooth then derivative
+v_s = moving_average(v_avg, w=9)
+dv = np.gradient(v_s, deg_u)
+
+# Knife-edge profile for width: use abs derivative (handles any sign)
+prof = np.abs(dv)
+
+# Width via second moment
+S = prof.sum()
+if S <= 1e-12:
+    center = sigma = w_1e2 = fwhm = 0.0
+else:
+    center = (prof * deg_u).sum() / S
+    var = (prof * (deg_u - center) ** 2).sum() / S
+    sigma = np.sqrt(max(var, 0.0))
+    w_1e2 = 2.0 * sigma
+    fwhm  = 2.355 * sigma
+
+print("\nBeam Width Results (angle domain):")
+print(f"  Center  = {center:.3f} deg")
+print(f"  Sigma   = {sigma:.4f} deg")
+print(f"  1/e^2   = {w_1e2:.3f} deg")
+print(f"  FWHM    = {fwhm:.3f} deg")
+
+# Plot voltage and derivative
+plt.figure()
+plt.plot(deg_u, v_s)
+plt.grid(True)
+plt.xlabel("Angle (deg)")
+plt.ylabel("Voltage (V)")
+plt.title("Voltage vs Angle (one scan)")
+
+plt.figure()
+plt.plot(deg_u, dv)
+plt.grid(True)
+plt.xlabel("Angle (deg)")
+plt.ylabel("dV/dAngle (V/deg)")
+plt.title("Derivative (one scan)")
+
+plt.show()

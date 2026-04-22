@@ -1,0 +1,557 @@
+import os
+import math
+from datetime import datetime
+
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ─────────────────────────────────────────────
+# Configuration — mirror the C defines here
+# ─────────────────────────────────────────────
+PORT             = "COM9"
+BAUD             = 115200
+CMD              = b"STEPPROFILE\n"
+SAVE_DIR         = "step_profile_runs"
+SERIAL_TIMEOUT_S = 1.0
+EMPTY_LIMIT      = 5000
+ADC_FS_HZ        = 10000.0
+RAW_SAMPLE_DT_S  = 1.0 / ADC_FS_HZ
+
+
+# ─────────────────────────────────────────────
+# DSP helpers
+# ─────────────────────────────────────────────
+def sg_smooth_5point(y):
+    y  = np.asarray(y, dtype=float)
+    n  = len(y)
+    if n < 5:
+        return y.copy()
+    ys = y.copy()
+    for i in range(2, n - 2):
+        ys[i] = (
+            -3.0 * y[i - 2]
+            + 12.0 * y[i - 1]
+            + 17.0 * y[i]
+            + 12.0 * y[i + 1]
+            - 3.0 * y[i + 2]
+        ) / 35.0
+    return ys
+
+
+def erf_model_idx(x_idx, x0_idx, w_idx, y_lo, y_hi):
+    w_idx   = max(float(w_idx), 1e-9)
+    a       = 0.5 * (y_hi - y_lo)
+    x_idx   = np.asarray(x_idx, dtype=float)
+    z       = (x_idx - float(x0_idx)) / w_idx
+    erf_val = np.array([math.erf(v) for v in z], dtype=float)
+    return 0.5 * (y_hi + y_lo) + a * erf_val
+
+
+def estimate_erf_initial_params(y):
+    y  = np.asarray(y, dtype=float)
+    n  = len(y)
+    if n < 2:
+        return 0.0, 2.0, float(y[0]) if n else 0.0, float(y[-1]) if n else 0.0
+    k      = max(3, n // 10)
+    y_lo   = float(np.median(y[:k]))
+    y_hi   = float(np.median(y[-k:]))
+    y_mid  = 0.5 * (y_lo + y_hi)
+    x0_idx = float(np.argmin(np.abs(y - y_mid)))
+    dy     = np.gradient(y)
+    peak   = float(np.max(np.abs(dy))) if len(dy) else 0.0
+    amp    = abs(y_hi - y_lo)
+    if peak > 1e-12:
+        a     = 0.5 * amp
+        w_idx = max((a * (2.0 / math.sqrt(math.pi))) / peak, 2.0) if a > 1e-12 else max(n / 20.0, 2.0)
+    else:
+        w_idx = max(n / 20.0, 2.0)
+    return x0_idx, w_idx, y_lo, y_hi
+
+
+def fit_erf_curve_simple(y, max_iters=80):
+    y      = np.asarray(y, dtype=float)
+    n      = len(y)
+    x      = np.arange(n, dtype=float)
+    x0, w, y_lo, y_hi = estimate_erf_initial_params(y)
+
+    def sse(p):
+        px0, pw, py_lo, py_hi = p
+        if pw < 1e-6:
+            return 1e30
+        return float(np.sum((y - erf_model_idx(x, px0, pw, py_lo, py_hi)) ** 2))
+
+    params = [x0, w, y_lo, y_hi]
+    best   = sse(params)
+    sx0    = max(8.0, n * 0.03)
+    sw     = max(4.0, n * 0.02)
+    sy     = max(1e-6, 0.05 * max(abs(y_hi - y_lo), 1e-6))
+
+    for _ in range(max_iters):
+        improved   = False
+        candidates = [
+            [params[0] + sx0, params[1],              params[2],        params[3]      ],
+            [params[0] - sx0, params[1],              params[2],        params[3]      ],
+            [params[0],       params[1] + sw,         params[2],        params[3]      ],
+            [params[0],       max(2.0, params[1]-sw), params[2],        params[3]      ],
+            [params[0],       params[1],              params[2] + sy,   params[3]      ],
+            [params[0],       params[1],              params[2] - sy,   params[3]      ],
+            [params[0],       params[1],              params[2],        params[3] + sy ],
+            [params[0],       params[1],              params[2],        params[3] - sy ],
+        ]
+        for cand in candidates:
+            val = sse(cand)
+            if val < best:
+                params, best, improved = cand, val, True
+        if not improved:
+            sx0 *= 0.5; sw *= 0.5; sy *= 0.5
+            if sx0 < 0.05 and sw < 0.05 and sy < 1e-6:
+                break
+
+    return {
+        "x0_idx": float(params[0]),
+        "w_idx":  max(float(params[1]), 2.0),
+        "y_lo":   float(params[2]),
+        "y_hi":   float(params[3]),
+        "sse":    float(best),
+    }
+
+
+def build_erf_fit_and_derivative(n, dt_s, x0_idx, w_idx, y_lo, y_hi):
+    x     = np.arange(n, dtype=float)
+    w_idx = max(float(w_idx), 1e-9)
+    a     = 0.5 * (y_hi - y_lo)
+    z     = (x - float(x0_idx)) / w_idx
+    fit_y = erf_model_idx(x, x0_idx, w_idx, y_lo, y_hi)
+    fit_d = a * (2.0 / math.sqrt(math.pi)) * np.exp(-(z * z)) / (w_idx * dt_s)
+    return fit_y, fit_d
+
+
+# ─────────────────────────────────────────────
+# Serial helpers
+# ─────────────────────────────────────────────
+def parse_keyvals(line: str):
+    out   = {}
+    parts = line.strip().split(",")
+    for p in parts[1:]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+# ─────────────────────────────────────────────
+# Plot one position's beam profile from raw scan
+# ─────────────────────────────────────────────
+def plot_beam_profile_at_position(scan, index, z_mm, d4sigma_mm, run_dir):
+    deg_vals  = np.asarray(scan["deg"],   dtype=float)
+    x_mm_vals = np.asarray(scan["x_mm"], dtype=float)
+    t_ms_vals = np.asarray(scan["t_ms"], dtype=float)
+    raw_p     = np.asarray(scan["p_mw"], dtype=float)
+
+    if len(raw_p) < 5:
+        print(f"  Position {index}: too few samples to plot beam profile.")
+        return
+
+    dt_s = (
+        1e-3 * float(np.median(np.diff(t_ms_vals)))
+        if len(t_ms_vals) >= 2
+        else RAW_SAMPLE_DT_S
+    )
+
+    deg_local  = deg_vals  - deg_vals[0]
+    x_local_mm = x_mm_vals - x_mm_vals[0]
+
+    # ── DSP ───────────────────────────────────────────────────────────────
+    kernel      = np.ones(5) / 5
+    avg_p       = np.convolve(raw_p, kernel, mode="same")
+    sg_p        = sg_smooth_5point(avg_p)
+    fit         = fit_erf_curve_simple(sg_p)
+    fit_p, dfit = build_erf_fit_and_derivative(
+        n=len(sg_p), dt_s=dt_s,
+        x0_idx=fit["x0_idx"], w_idx=fit["w_idx"],
+        y_lo=fit["y_lo"],     y_hi=fit["y_hi"],
+    )
+
+    t0_idx  = int(np.argmax(np.abs(dfit)))
+    t0_deg  = float(deg_local[t0_idx])
+    t0_x_mm = float(x_local_mm[t0_idx])
+    t0_p_mw = float(raw_p[t0_idx])
+
+    x_rel = x_local_mm - t0_x_mm
+
+    # ── Python-side beam width from derivative ────────────────────────────
+    profile_abs = np.abs(dfit)
+    w_sum = profile_abs.sum()
+    if w_sum > 0:
+        mu_mm    = float((profile_abs * x_rel).sum() / w_sum)
+        var_mm2  = float((profile_abs * (x_rel - mu_mm) ** 2).sum() / w_sum)
+        sigma_mm = float(np.sqrt(max(var_mm2, 0.0)))
+    else:
+        mu_mm = sigma_mm = 0.0
+    width_4sigma_py = 4.0 * sigma_mm
+
+    # STM32 d4sigma half-width edges centred on T0
+    half_stm = d4sigma_mm / 2.0
+
+    base = os.path.join(run_dir, f"pos{index:02d}_z{z_mm:.2f}mm")
+
+    # ── Plot 1 – power vs position with T0 and beam width annotation ──────
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    ax.plot(x_local_mm, raw_p,
+            color="steelblue", lw=1.2, alpha=0.6, label="Raw power (mW)")
+    ax.plot(x_local_mm, fit_p,
+            color="darkorange", lw=1.8, label="Erf fit (mW)")
+
+    # T0 vertical line
+    ax.axvline(t0_x_mm, color="red", ls="--", lw=1.5,
+               label=f"T0  x = {t0_x_mm:.3f} mm  |  P = {t0_p_mw:.4f} mW")
+
+    # Beam width shading (STM32 d4sigma)
+    ax.axvspan(t0_x_mm - half_stm, t0_x_mm + half_stm,
+               alpha=0.15, color="green",
+               label=f"4σ (STM32) = {d4sigma_mm:.4f} mm")
+    ax.axvline(t0_x_mm - half_stm, color="green", ls=":", lw=1.2)
+    ax.axvline(t0_x_mm + half_stm, color="green", ls=":", lw=1.2)
+
+    # Horizontal power level at T0
+    ax.axhline(t0_p_mw, color="red", ls=":", lw=1.0, alpha=0.5)
+
+    # Arrow annotation for T0 power
+    p_range = raw_p.max() - raw_p.min()
+    x_range = x_local_mm.max() - x_local_mm.min()
+    ax.annotate(
+        f"P(T0) = {t0_p_mw:.4f} mW",
+        xy=(t0_x_mm, t0_p_mw),
+        xytext=(t0_x_mm + 0.12 * x_range,
+                t0_p_mw + 0.08 * p_range),
+        fontsize=9, color="red",
+        arrowprops=dict(arrowstyle="->", color="red", lw=1.0),
+    )
+
+    # Beam width bracket
+    bracket_y = raw_p.max() * 0.93
+    ax.annotate(
+        "",
+        xy=(t0_x_mm + half_stm, bracket_y),
+        xytext=(t0_x_mm - half_stm, bracket_y),
+        arrowprops=dict(arrowstyle="<->", color="green", lw=1.5),
+    )
+    ax.text(
+        t0_x_mm, bracket_y + 0.02 * p_range,
+        f"4σ = {d4sigma_mm:.4f} mm",
+        ha="center", va="bottom", fontsize=9, color="green",
+    )
+
+    ax.set_xlabel("Position (mm)")
+    ax.set_ylabel("Power (mW)")
+    ax.set_title(
+        f"Position {index}  —  z = {z_mm:.3f} mm\n"
+        f"T0 = {t0_x_mm:.4f} mm   |   P(T0) = {t0_p_mw:.4f} mW   |   "
+        f"4σ (STM32) = {d4sigma_mm:.4f} mm   |   4σ (Python) = {width_4sigma_py:.4f} mm"
+    )
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(base + "_power_vs_position.png", dpi=300)
+    plt.close(fig)
+
+    # ── Plot 2 – normalised beam profile centred on T0 ────────────────────
+    profile_norm = profile_abs.copy()
+    if profile_norm.max() > 0:
+        profile_norm /= profile_norm.max()
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    ax.plot(x_rel, profile_norm,
+            color="seagreen", lw=1.5,
+            label="|d/dx erf fit|  (normalised)")
+
+    # T0 marker
+    ax.axvline(0.0, color="red", ls="--", lw=1.5, label="T0")
+
+    # STM32 d4sigma shading centred on T0
+    ax.axvspan(-half_stm, half_stm,
+               alpha=0.15, color="steelblue",
+               label=f"4σ (STM32) = {d4sigma_mm:.4f} mm")
+    ax.axvline(-half_stm, color="steelblue", ls=":", lw=1.2)
+    ax.axvline( half_stm, color="steelblue", ls=":", lw=1.2)
+
+    # Python-side 4sigma for comparison
+    half_py = width_4sigma_py / 2.0
+    ax.axvline(-half_py, color="darkorange", ls="-.", lw=1.2,
+               label=f"4σ (Python) = {width_4sigma_py:.4f} mm")
+    ax.axvline( half_py, color="darkorange", ls="-.", lw=1.2)
+
+    # Width bracket for STM32 value
+    bracket_y = 0.93
+    ax.annotate(
+        "",
+        xy=( half_stm, bracket_y),
+        xytext=(-half_stm, bracket_y),
+        arrowprops=dict(arrowstyle="<->", color="steelblue", lw=1.5),
+    )
+    ax.text(
+        0.0, bracket_y + 0.03,
+        f"4σ = {d4sigma_mm:.4f} mm",
+        ha="center", va="bottom", fontsize=9, color="steelblue",
+    )
+
+    ax.set_xlabel("Position relative to T0 (mm)")
+    ax.set_ylabel("Normalised beam profile")
+    ax.set_title(
+        f"Position {index}  —  z = {z_mm:.3f} mm  —  Beam Profile\n"
+        f"4σ (STM32) = {d4sigma_mm:.4f} mm   |   4σ (Python) = {width_4sigma_py:.4f} mm"
+    )
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(base + "_beam_profile.png", dpi=300)
+    plt.close(fig)
+
+    print(
+        f"  Position {index:02d}  z={z_mm:.3f} mm  "
+        f"T0={t0_x_mm:.4f} mm  P(T0)={t0_p_mw:.4f} mW  "
+        f"4σ_stm={d4sigma_mm:.4f} mm  4σ_py={width_4sigma_py:.4f} mm"
+    )
+
+
+# ─────────────────────────────────────────────
+# Collect all data from serial
+# ─────────────────────────────────────────────
+def collect_step_profile(ser, run_dir):
+    points        = []
+    meta          = {}
+    empty_count   = 0
+    in_scan       = False
+    pending_point = None
+
+    idx_list   = []; enc_list  = []; deg_list  = []
+    x_mm_list  = []; stage_list = []; raw_list = []
+    v_list     = []; p_list    = []
+    sample_dt_ms = 1000.0 * RAW_SAMPLE_DT_S
+    axis = 0
+
+    while True:
+        line = ser.readline().decode(errors="ignore").strip()
+
+        if not line:
+            empty_count += 1
+            if empty_count > EMPTY_LIMIT:
+                raise RuntimeError("Serial timeout waiting for STEP_PROFILE data.")
+            continue
+
+        empty_count = 0
+        print(line)
+
+        # ── step-profile control lines ────────────────────────────────────
+        if line.startswith("STEP_PROFILE_BEGIN"):
+            kv   = parse_keyvals(line)
+            meta = {
+                "steps":         int(kv.get("steps",     "0")),
+                "step_mm":       float(kv.get("step_mm",   "0")),
+                "num_positions": int(kv.get("positions", "0")),
+                "axis":          int(kv.get("axis",      "0")),
+            }
+            axis = meta["axis"]
+
+        elif line.startswith("STEP_PROFILE_HOME_FAIL"):
+            raise RuntimeError("STM32: Z-stage homing failed.")
+
+        elif line.startswith("STEP_PROFILE_POINT"):
+            kv = parse_keyvals(line)
+            pending_point = {
+                "index":      int(kv.get("index",       "0")),
+                "z_mm":       float(kv.get("z_mm",       "0")),
+                "d4sigma_mm": float(kv.get("d4sigma_mm", "0")),
+                "valid":      True,
+            }
+
+        elif line.startswith("STEP_PROFILE_FAIL"):
+            kv = parse_keyvals(line)
+            points.append({
+                "index":      int(kv.get("index", "0")),
+                "z_mm":       float(kv.get("z_mm",  "0")),
+                "d4sigma_mm": float("nan"),
+                "valid":      False,
+            })
+            pending_point = None
+
+        elif line.startswith("STEP_PROFILE_DONE"):
+            break
+
+        # ── raw scan lines ────────────────────────────────────────────────
+        elif line.startswith("RAW_SCAN_BEGIN"):
+            kv           = parse_keyvals(line)
+            stride       = float(kv.get("stride",      "1"))
+            emit_stride  = float(kv.get("emit_stride", "1"))
+            sample_dt_ms = 1000.0 * RAW_SAMPLE_DT_S * stride * emit_stride
+            in_scan      = True
+            idx_list   = []; enc_list  = []; deg_list  = []
+            x_mm_list  = []; stage_list = []; raw_list = []
+            v_list     = []; p_list    = []
+
+        elif line.startswith("RAW_SCAN,") and in_scan:
+            parts = line.split(",")
+            if len(parts) != 11:
+                continue
+            try:
+                idx_list.append(int(parts[3]))
+                enc_list.append(int(parts[4]))
+                deg_list.append(float(parts[5]))
+                x_mm_list.append(float(parts[6]))
+                stage_list.append(int(parts[7]))
+                raw_list.append(int(parts[8]))
+                v_list.append(float(parts[9]))
+                p_list.append(float(parts[10]))
+            except ValueError:
+                continue
+
+        elif line.startswith("RAW_SCAN_DONE"):
+            in_scan = False
+
+            if pending_point is not None and idx_list:
+                idx_arr = np.asarray(idx_list, dtype=int)
+                scan = {
+                    "axis":  axis,
+                    "deg":   np.asarray(deg_list,  dtype=float),
+                    "x_mm":  np.asarray(x_mm_list, dtype=float),
+                    "t_ms":  sample_dt_ms * idx_arr.astype(float),
+                    "p_mw":  np.asarray(p_list,    dtype=float),
+                }
+                plot_beam_profile_at_position(
+                    scan,
+                    pending_point["index"],
+                    pending_point["z_mm"],
+                    pending_point["d4sigma_mm"],
+                    run_dir,
+                )
+                points.append(pending_point)
+                pending_point = None
+
+    return points, meta
+
+
+# ─────────────────────────────────────────────
+# Summary plots + CSV
+# ─────────────────────────────────────────────
+def plot_summary(points, meta, run_dir):
+    if not points:
+        print("No data points to summarise.")
+        return
+
+    z_all      = np.array([p["z_mm"]       for p in points], dtype=float)
+    w_all      = np.array([p["d4sigma_mm"] for p in points], dtype=float)
+    valid_mask = np.array([p["valid"]      for p in points], dtype=bool)
+
+    z_valid = z_all[valid_mask]
+    w_valid = w_all[valid_mask]
+
+    axis_str = str(meta.get("axis", "?"))
+    step_mm  = meta.get("step_mm", float("nan"))
+    steps    = meta.get("steps",   "?")
+
+    print(f"\n{'='*55}")
+    print(f"  Axis          : {axis_str}")
+    print(f"  Steps/move    : {steps}  ({step_mm:.4f} mm)")
+    print(f"  Total points  : {len(points)}")
+    print(f"  Valid points  : {int(valid_mask.sum())}")
+    if len(w_valid):
+        print(f"  4σ range      : {w_valid.min():.4f} – {w_valid.max():.4f} mm")
+        print(f"  4σ mean       : {w_valid.mean():.4f} mm")
+    print(f"{'='*55}\n")
+
+    base = os.path.join(run_dir, f"step_profile_axis{axis_str}")
+
+    # ── width vs Z ────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(11, 5))
+    if valid_mask.sum() > 0:
+        ax.plot(z_valid, w_valid,
+                color="steelblue", lw=1.5, marker="o", ms=5,
+                label="4σ beam width (mm)")
+    if (~valid_mask).sum() > 0:
+        ax.scatter(z_all[~valid_mask],
+                   np.zeros(int((~valid_mask).sum())),
+                   color="red", marker="x", s=60, zorder=5,
+                   label="Measurement failed")
+    ax.set_xlabel("Z position (mm)")
+    ax.set_ylabel("4σ beam width (mm)")
+    ax.set_title(
+        f"Axis {axis_str} — Beam Width vs Z\n"
+        f"({steps} steps/move = {step_mm:.4f} mm)"
+    )
+    ax.legend()
+    ax.grid(True, alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(base + "_width_vs_z.png", dpi=300)
+    plt.close(fig)
+    print(f"Saved -> {base}_width_vs_z.png")
+
+    # ── per-position bar chart ─────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.bar(
+        range(len(points)),
+        [p["d4sigma_mm"] if p["valid"] else 0.0 for p in points],
+        color=["steelblue" if p["valid"] else "salmon" for p in points],
+        edgecolor="white", linewidth=0.5,
+    )
+    ax.set_xticks(range(len(points)))
+    ax.set_xticklabels(
+        [f"{p['z_mm']:.2f}" for p in points],
+        rotation=45, ha="right", fontsize=8,
+    )
+    ax.set_xlabel("Z position (mm)")
+    ax.set_ylabel("4σ beam width (mm)")
+    ax.set_title(f"Axis {axis_str} — Per-Position Results  (blue=valid, red=failed)")
+    ax.grid(True, axis="y", alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(base + "_per_position.png", dpi=300)
+    plt.close(fig)
+    print(f"Saved -> {base}_per_position.png")
+
+    # ── CSV ────────────────────────────────────────────────────────────────
+    csv_path = base + "_results.csv"
+    header = (
+        f"# axis,{axis_str}\n"
+        f"# steps_per_move,{steps}\n"
+        f"# step_mm,{step_mm:.6f}\n"
+        "index,z_mm,d4sigma_mm,valid"
+    )
+    data = np.column_stack((
+        [p["index"]      for p in points],
+        [p["z_mm"]       for p in points],
+        [p["d4sigma_mm"] if p["valid"] else float("nan") for p in points],
+        [int(p["valid"]) for p in points],
+    ))
+    np.savetxt(csv_path, data, delimiter=",",
+               header=header, comments="", fmt="%s")
+    print(f"Saved -> {csv_path}")
+
+
+# ─────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────
+def main():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir   = os.path.join(SAVE_DIR, f"run_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    print(f"Opening {PORT} @ {BAUD}")
+    ser = serial.Serial(PORT, BAUD, timeout=SERIAL_TIMEOUT_S)
+
+    try:
+        print(f"Sending: {CMD.decode().strip()}")
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        ser.write(CMD)
+
+        points, meta = collect_step_profile(ser, run_dir)
+        plot_summary(points, meta, run_dir)
+
+    finally:
+        ser.close()
+
+
+if __name__ == "__main__":
+    main()

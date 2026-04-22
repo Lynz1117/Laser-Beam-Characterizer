@@ -1,0 +1,145 @@
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+
+PORT = "COM7"
+BAUD = 115200
+CMD = b"T0M1\n"   # or b"T0M2\n"
+
+RPM = 10.0
+R_MM = 25.0
+SMOOTH_WIN = 9
+
+ser = serial.Serial(PORT, BAUD, timeout=2)
+ser.reset_input_buffer()
+ser.reset_output_buffer()
+
+t_ms = []
+p_mw = []
+
+axis = None
+t0_ms_stm = None
+t0_idx_stm = None
+t0_p_stm = None
+fs_hz = 10000.0
+
+print(f"Sending {CMD!r} ...")
+ser.write(CMD)
+
+while True:
+    line = ser.readline().decode(errors="ignore").strip()
+    if not line:
+        continue
+
+    print(line)
+
+    if line.startswith("T0_RESULT"):
+        parts = {}
+        for item in line.split(",")[1:]:
+            k, v = item.split("=")
+            parts[k] = v
+        axis = int(parts["axis"])
+        t0_idx_stm = int(parts["idx"])
+        t0_ms_stm = float(parts["t0_ms"])
+        t0_p_stm = float(parts["P"])
+
+    elif line.startswith("T0_RAW_BEGIN"):
+        parts = {}
+        for item in line.split(",")[1:]:
+            if "=" in item:
+                k, v = item.split("=")
+                parts[k] = v
+        axis = int(parts["axis"])
+        fs_hz = float(parts["fs"])
+
+    elif line.startswith("RAW,"):
+        parts = line.split(",")
+        axis = int(parts[1])
+        idx = int(parts[2])
+        tm = float(parts[3])
+        power = float(parts[4])
+
+        t_ms.append(tm)
+        p_mw.append(power)
+
+    elif line.startswith("T0_RAW_DONE"):
+        break
+
+ser.close()
+
+t_ms = np.array(t_ms, dtype=float)
+p_mw = np.array(p_mw, dtype=float)
+
+if len(t_ms) == 0:
+    raise RuntimeError("No RAW power samples received.")
+
+if SMOOTH_WIN < 1:
+    SMOOTH_WIN = 1
+if SMOOTH_WIN % 2 == 0:
+    SMOOTH_WIN += 1
+
+kernel = np.ones(SMOOTH_WIN, dtype=float) / SMOOTH_WIN
+p_smooth = np.convolve(p_mw, kernel, mode="same")
+
+omega_rad_s = 2.0 * np.pi * RPM / 60.0
+theta_rad = omega_rad_s * (t_ms / 1000.0)
+theta_deg = np.degrees(theta_rad)
+x_mm = R_MM * theta_rad
+
+abs_dpdx = np.abs(np.gradient(p_smooth, x_mm))
+
+x_t0_mm = None
+theta_t0_deg = None
+if t0_ms_stm is not None:
+    t0_s = t0_ms_stm / 1000.0
+    theta_t0_deg = np.degrees(omega_rad_s * t0_s)
+    x_t0_mm = R_MM * omega_rad_s * t0_s
+
+print("\n----- SUMMARY -----")
+print(f"Axis: {axis}")
+print(f"Samples received: {len(p_mw)}")
+print(f"Sample rate: {fs_hz:.1f} Hz")
+print(f"RPM for conversion: {RPM:.3f}")
+if t0_ms_stm is not None:
+    print(f"STM32 T0 index:  {t0_idx_stm}")
+    print(f"STM32 T0 time:   {t0_ms_stm:.6f} ms")
+    print(f"STM32 T0 power:  {t0_p_stm:.6f} mW")
+    print(f"STM32 T0 angle:  {theta_t0_deg:.6f} deg")
+    print(f"STM32 T0 pos:    {x_t0_mm:.6f} mm")
+
+plt.figure()
+plt.plot(theta_deg, p_mw, label="Power (mW)")
+plt.plot(theta_deg, p_smooth, label="Smoothed Power")
+if theta_t0_deg is not None:
+    plt.axvline(theta_t0_deg, linestyle="--", linewidth=2,
+                label=f"STM32 T0 = {theta_t0_deg:.3f} deg")
+plt.xlabel("Angle (deg)")
+plt.ylabel("Power (mW)")
+plt.title(f"Full Scan Power vs Angle - Axis {axis}")
+plt.legend()
+plt.grid(True)
+
+plt.figure()
+plt.plot(x_mm, p_mw, label="Power (mW)")
+plt.plot(x_mm, p_smooth, label="Smoothed Power")
+if x_t0_mm is not None:
+    plt.axvline(x_t0_mm, linestyle="--", linewidth=2,
+                label=f"STM32 T0 = {x_t0_mm:.3f} mm")
+plt.xlabel("Position (mm)")
+plt.ylabel("Power (mW)")
+plt.title(f"Full Scan Power vs Position - Axis {axis}")
+plt.legend()
+plt.grid(True)
+
+plt.figure()
+plt.plot(x_mm, abs_dpdx, label="|dP/dx|")
+if x_t0_mm is not None:
+    plt.axvline(x_t0_mm, linestyle="--", linewidth=2,
+                label=f"STM32 T0 = {x_t0_mm:.3f} mm")
+plt.xlabel("Position (mm)")
+plt.ylabel("Absolute derivative")
+plt.title(f"Derivative vs Position - Axis {axis}")
+plt.legend()
+plt.grid(True)
+
+plt.show()

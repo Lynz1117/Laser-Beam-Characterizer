@@ -1,0 +1,398 @@
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# =======================
+# Serial config
+# =======================
+PORT = "COM3"
+BAUD = 115200
+ser = serial.Serial(PORT, BAUD, timeout=1)
+
+# =======================
+# Geometry
+# =======================
+R_MM = 25.0  # servo arm radius = 2.5 cm = 25 mm (shaft -> knife edge)
+
+# Crop window (degrees) for FIRST edge / first peak region
+CROP_MIN_DEG = 38.0
+CROP_MAX_DEG = 48.0
+
+# Smoothing (odd preferred; code enforces odd)
+MA_W = 5  # try 5, 7, 9
+
+# =======================
+# Helpers
+# =======================
+def moving_average(y, w=9):
+    y = np.asarray(y, dtype=float)
+    if y.size < w:
+        return y
+    if w % 2 == 0:
+        w += 1
+    k = np.ones(w) / w
+    return np.convolve(y, k, mode="same")
+
+
+def parse_bm(line):
+    line = line.strip()
+    if line == "BM_DONE":
+        return ("DONE",)
+    if not line.startswith("BM,"):
+        return None
+    p = line.split(",")
+    if len(p) < 4:
+        return None
+    try:
+        t_ms = int(p[1])
+        deg = float(p[2])
+        v = float(p[3])
+        return ("BM", t_ms, deg, v)
+    except ValueError:
+        return None
+
+
+def collapse_duplicates(deg, v, quantize=None):
+    """
+    Collapse duplicate (or nearly duplicate) degrees by averaging voltages.
+    quantize: set e.g. 0.1 or 0.01 if degrees have float jitter.
+    """
+    deg = np.asarray(deg, float)
+    v = np.asarray(v, float)
+
+    if quantize is not None:
+        deg = np.round(deg / quantize) * quantize
+
+    order = np.argsort(deg)
+    deg = deg[order]
+    v = v[order]
+
+    deg_u, inv = np.unique(deg, return_inverse=True)
+    v_sum = np.bincount(inv, weights=v)
+    v_cnt = np.bincount(inv)
+    v_u = v_sum / np.maximum(v_cnt, 1)
+    return deg_u, v_u
+
+
+def resample_uniform(x, y, step=None):
+    """
+    Resample (x,y) onto a uniform x-grid (helps stabilize derivatives).
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    if x.size < 2:
+        return x, y
+
+    dx = np.diff(x)
+    dx = dx[dx > 0]
+    if dx.size == 0:
+        return x, y
+
+    if step is None:
+        step = float(np.median(dx))
+
+    x0, x1 = float(x[0]), float(x[-1])
+    grid = np.arange(x0, x1 + 0.5 * step, step)
+    yg = np.interp(grid, x, y)
+    return grid, yg
+
+
+def beam_width_1e2(x_mm, profile):
+    """
+    1/e^2 beam width (diameter):
+      - find peak (x0,y0)
+      - threshold y_th = y0/e^2
+      - find crossings x1,x2
+      - width = x2-x1
+    """
+    x = np.asarray(x_mm, float)
+    y = np.asarray(profile, float)
+
+    if y.size < 3 or np.max(y) <= 0:
+        return None
+
+    peak_idx = int(np.argmax(y))
+    x0 = float(x[peak_idx])
+    y0 = float(y[peak_idx])
+
+    y_th = y0 / (np.e ** 2)
+
+    # left crossing
+    x1 = None
+    for i in range(peak_idx, 0, -1):
+        if y[i] >= y_th and y[i - 1] < y_th:
+            denom = y[i] - y[i - 1]
+            x1 = float(x[i]) if abs(denom) < 1e-15 else float(
+                x[i - 1] + (y_th - y[i - 1]) * (x[i] - x[i - 1]) / denom
+            )
+            break
+
+    # right crossing
+    x2 = None
+    for i in range(peak_idx, y.size - 1):
+        if y[i] >= y_th and y[i + 1] < y_th:
+            denom = y[i + 1] - y[i]
+            x2 = float(x[i]) if abs(denom) < 1e-15 else float(
+                x[i] + (y_th - y[i]) * (x[i + 1] - x[i]) / denom
+            )
+            break
+
+    if x1 is None or x2 is None or x2 <= x1:
+        return None
+
+    return {
+        "x0": x0, "y0": y0,
+        "x1": x1, "y1": float(y_th),
+        "x2": x2, "y2": float(y_th),
+        "width_1e2": float(x2 - x1),
+    }
+
+def smooth_ma(y, w):
+    y = np.asarray(y, float)
+    if w < 3:
+        return y
+    if w % 2 == 0:
+        w += 1
+    k = np.ones(w) / w
+    return np.convolve(y, k, mode="same")
+
+def interp_uniform(x, y, dx):
+    """Interpolate (x,y) onto a uniform grid with spacing dx."""
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    order = np.argsort(x)
+    x = x[order]; y = y[order]
+
+    # keep strictly increasing x
+    keep = np.concatenate(([True], np.diff(x) > 1e-12))
+    x = x[keep]; y = y[keep]
+
+    xu = np.arange(x[0], x[-1] + 0.5*dx, dx)
+    yu = np.interp(xu, x, y)
+    return xu, yu
+
+def matlab_diff_derivative(x, P):
+    """
+    MATLAB-style derivative:
+      dx = diff(x)
+      dP = diff(P)
+      dP_dx = dP./dx
+      x_mid = x(1:end-1) + dx/2  (midpoints)
+    Returns x_mid, dP_dx
+    """
+    x = np.asarray(x, float)
+    P = np.asarray(P, float)
+
+    dx = np.diff(x)
+    dP = np.diff(P)
+
+    good = dx > 1e-12
+    dx = dx[good]
+    dP = dP[good]
+
+    x_mid = x[:-1][good] + dx / 2.0
+    dP_dx = dP / dx
+    return x_mid, dP_dx
+
+def integral_trapz(x, y):
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    if x.shape != y.shape:
+        raise ValueError("Vectors must be of the same length")
+    return float(np.trapezoid(y, x))  # NumPy 2.x
+
+
+def moment_width_from_derivative(x_mm, dIdx):
+    """
+    MATLAB-style moment method on derivative profile:
+      Area  = ∫ dIdx dx
+      center= ∫ x*dIdx dx / Area
+      sigma = sqrt( ∫ (x-center)^2*dIdx dx / Area )
+      D4s   = 4*sigma
+    """
+    x = np.asarray(x_mm, float)
+    y = np.asarray(dIdx, float)
+    y = np.clip(y, 0, None)
+
+    Area = integral_trapz(x, y)
+    if Area <= 1e-15:
+        return None
+
+    center = integral_trapz(x, x * y) / Area
+    sigma = np.sqrt(max(integral_trapz(x, (x - center) ** 2 * y) / Area, 0.0))
+    D4s = 4.0 * sigma
+    return Area, center, sigma, D4s
+
+
+# =======================
+# Acquire one scan
+# =======================
+print("Listening... waiting for one 0→180 scan (BM... then BM_DONE)")
+
+deg_list, v_list = [], []
+
+while True:
+    s = ser.readline().decode(errors="ignore")
+    if not s:
+        continue
+
+    msg = parse_bm(s)
+    if msg is None:
+        continue
+
+    if msg[0] == "DONE":
+        print("Scan complete.")
+        break
+
+    _, _, deg, v = msg
+    deg_list.append(deg)
+    v_list.append(v)
+
+deg_raw = np.asarray(deg_list, float)
+v_raw = np.asarray(v_list, float)
+
+# =======================
+# OPTIONAL FIX: keep only forward sweep (remove return/reverse segments)
+# If your data still "scribbles", uncomment this.
+# =======================
+keep_fwd = np.concatenate(([True], np.diff(deg_raw) > 0))
+deg_raw = deg_raw[keep_fwd]
+v_raw   = v_raw[keep_fwd]
+
+# =======================
+# Clean + resample (in angle domain)
+# =======================
+deg_u, v_u = collapse_duplicates(deg_raw, v_raw, quantize=None)
+deg_g, v_g = resample_uniform(deg_u, v_u, step=0.10)
+
+# Smooth voltage
+v_s = moving_average(v_g, w=MA_W)
+
+# Save clean angle-ordered arrays for plotting (before x_mm sorting)
+deg_plot = deg_g.copy()
+v_plot = v_s.copy()
+dv_plot = np.gradient(v_plot, deg_plot)  # display derivative only
+
+# =======================
+# Angle -> position (mm)
+# =======================
+theta = np.deg2rad(deg_g)
+x_mm = R_MM * np.sin(theta)
+
+# Sort by x to match MATLAB's monotonic assumption
+order = np.argsort(x_mm)
+x_mm = x_mm[order]
+deg_g = deg_g[order]
+v_s = v_s[order]
+
+# Keep strictly increasing x
+dx = np.diff(x_mm)
+keep = np.concatenate(([True], dx > 1e-12))
+x_mm = x_mm[keep]
+deg_g = deg_g[keep]
+v_s = v_s[keep]
+
+# =======================
+# HARD-CODED CROP (degrees)
+# =======================
+mask = (deg_g >= CROP_MIN_DEG) & (deg_g <= CROP_MAX_DEG)
+deg_c = deg_g[mask]
+x_c   = x_mm[mask]
+v_c   = v_s[mask]
+
+if deg_c.size < 10:
+    raise RuntimeError("Crop window too small. Widen CROP_MIN_DEG / CROP_MAX_DEG.")
+
+print(f"Hard crop: deg {deg_c[0]:.2f}° to {deg_c[-1]:.2f}°  (N={len(deg_c)})")
+
+# =======================
+# MATLAB-like: treat voltage as P(x)
+# baseline remove + normalize to [0,1]
+# =======================
+P = v_c - np.min(v_c)
+P = P / (np.max(P) + 1e-15)
+
+# (optional) smooth like MATLAB ideal erf
+P = moving_average(P, w=MA_W)
+
+# ---- KEY #1: interpolate to a finer, uniform x grid (makes plots smooth)
+DX_MM = 0.05  # try 0.02mm, 0.01mm if you have enough range
+x_u, P_u = interp_uniform(x_c, P, dx=DX_MM)
+
+# ---- KEY #2: smooth BEFORE derivative
+P_u = smooth_ma(P_u, w=21)    # try 11, 21, 31
+
+# =======================
+# MATLAB-style derivative using diff (midpoints)
+# =======================
+x_mid, dP_dx = matlab_diff_derivative(x_u, P_u)
+# Optional: smooth the derivative too (often helps a lot)
+dP_dx = smooth_ma(dP_dx, w=21)
+
+# remove boundary derivative artifacts
+x_mid = x_mid[2:-2]
+dP_dx = dP_dx[2:-2]
+deg_mid = np.interp(x_mid, x_c, deg_c)  # for plotting in degrees
+
+# Knife-edge profile should be positive
+prof = np.clip(dP_dx, 0, None)
+if prof.sum() <= 1e-15:
+    prof = np.clip(-dP_dx, 0, None)
+
+# For plotting in degrees, map x -> deg using interpolation from the cropped region
+deg_u = np.interp(x_u, x_c, deg_c)
+deg_mid = np.interp(x_mid, x_u, deg_u)
+
+# =======================
+# MATLAB moment method (trapz)
+# =======================
+Area = np.trapezoid(prof, x_mid)
+if Area <= 1e-15:
+    raise RuntimeError("Area too small. Increase smoothing (MA_W) or widen crop.")
+
+center = np.trapezoid(x_mid * prof, x_mid) / Area
+sigma  = np.sqrt(np.trapezoid(((x_mid - center) ** 2) * prof, x_mid) / Area)
+D4s    = 4.0 * sigma
+
+# MATLAB-style extra: 1/e^2 diameter from sigma (Gaussian relation)
+dia_1e2 = 2.0 * np.sqrt(2.0) * sigma
+
+print("\nMoment Beam Width Results (MATLAB-style, HARD CROP):")
+print(f"  Area   = {Area:.6e}")
+print(f"  center = {center:.4f} mm")
+print(f"  sigma  = {sigma:.4f} mm")
+print(f"  D4s=4σ = {D4s:.4f} mm")
+print(f"  1/e^2 diameter (from sigma) = {dia_1e2:.4f} mm")
+
+# =======================
+# Plots (in degrees)
+# =======================
+plt.figure()
+plt.plot(deg_plot, v_plot)
+plt.grid(True)
+plt.xlabel("Angle (deg)")
+plt.ylabel("Voltage (V)")
+plt.title("Voltage vs Angle (one scan, duplicates removed)")
+
+plt.figure()
+plt.plot(deg_u, P_u)
+plt.grid(True)
+plt.xlabel("Angle (deg)")
+plt.ylabel("Power (normalized)")
+plt.title("Knife Edge Scan (HARD crop)")
+
+plt.figure()
+plt.plot(deg_mid, prof)
+plt.grid(True)
+plt.xlabel("Angle (deg)")
+plt.ylabel("dP/dx (arb/mm)")
+plt.title("Derivative of Knife Edge Curve (HARD crop)")
+
+# center ± 2σ shown as vertical lines (convert mm->deg by interpolation)
+deg_m2 = np.interp(center - 2*sigma, x_c, deg_c)
+deg_p2 = np.interp(center + 2*sigma, x_c, deg_c)
+plt.axvline(deg_m2, linestyle="--")
+plt.axvline(deg_p2, linestyle="--")
+
+plt.show()

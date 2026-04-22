@@ -1,0 +1,1056 @@
+import os
+import time
+import math
+import queue
+import threading
+from datetime import datetime
+
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
+
+# ============================================================
+# User settings
+# ============================================================
+USE_FAKE_SERIAL = False
+
+PORT = "COM7"
+BAUD = 115200
+
+START_CMD = b"PROFILE\n"
+STOKES_CMD = b"STOKES\n"
+ABORT_CMD = b"ABORT\n"
+
+R_MM = 30.0
+
+MA_W_V = 5
+MA_W_P = 7
+MA_W_D = 5
+
+STALL_TIMEOUT_S = 3.0
+SCAN_TIMEOUT_S = 90.0
+
+PROFILE_THRESH_FRAC = 0.06
+PROFILE_HALF_WIN_MM = 4.5
+
+EDGE_FRAC = 0.15
+MONO_SCORE_THRESH = 0.65
+
+# ============================================================
+# Helpers
+# ============================================================
+def parse_bm(line):
+    try:
+        parts = line.strip().split(',')
+
+        if len(parts) != 9:
+            return None
+
+        kind = parts[0]
+
+        axis = int(parts[1])
+        scan_no = int(parts[2])
+        t_ms = float(parts[3])
+        deg = float(parts[4])
+        stage = int(parts[5])
+        raw = int(parts[6])
+        v = float(parts[7])
+        p_mw = float(parts[8])
+
+        return {
+            "kind": kind,
+            "axis": axis,
+            "scan": scan_no,
+            "t_ms": t_ms,
+            "deg": deg,
+            "stage": stage,
+            "raw": raw,
+            "v": v,
+            "p_mw": p_mw
+        }
+
+    except Exception as e:
+        print("PARSE ERROR:", e, line)
+        return None
+
+
+def moving_average(y, w):
+    y = np.asarray(y, float)
+    if len(y) < max(3, w):
+        return y.copy()
+    if w % 2 == 0:
+        w += 1
+    pad = w // 2
+    ypad = np.pad(y, (pad, pad), mode="edge")
+    k = np.ones(w, dtype=float) / float(w)
+    return np.convolve(ypad, k, mode="valid")
+
+
+def normalize_01(y):
+    y = np.asarray(y, float)
+    y0 = np.min(y)
+    y1 = np.max(y)
+    if (y1 - y0) <= 1e-12:
+        return np.zeros_like(y)
+    return (y - y0) / (y1 - y0)
+
+
+def robust_edge_levels(sig, frac=EDGE_FRAC):
+    sig = np.asarray(sig, float)
+    n = len(sig)
+    k = max(3, int(frac * n))
+    left = np.median(sig[:k])
+    right = np.median(sig[-k:])
+    return left, right
+
+
+def is_mostly_monotonic(y):
+    y = np.asarray(y, float)
+    if len(y) < 8:
+        return True
+
+    dy = np.diff(y)
+    if np.all(np.abs(dy) < 1e-12):
+        return True
+
+    total_var = np.sum(np.abs(dy)) + 1e-12
+    end_to_end = abs(y[-1] - y[0])
+    mono_score = end_to_end / total_var
+
+    i_peak = int(np.argmax(y))
+    i_valley = int(np.argmin(y))
+    interior_peak = (0 < i_peak < len(y) - 1)
+    interior_valley = (0 < i_valley < len(y) - 1)
+
+    if mono_score < MONO_SCORE_THRESH and (interior_peak or interior_valley):
+        return False
+
+    return True
+
+
+def knife_from_monotonic_power(p_s):
+    left, right = robust_edge_levels(p_s)
+
+    P = (p_s - left) / (right - left + 1e-12)
+    P = np.clip(P, 0.0, 1.0)
+
+    k = max(3, len(P) // 10)
+    if np.mean(P[:k]) < np.mean(P[-k:]):
+        P = 1.0 - P
+
+    P = moving_average(P, MA_W_P)
+    P = np.clip(P, 0.0, 1.0)
+    return P
+
+
+def profile_from_hump_power(x_mm, p_s):
+    left, right = robust_edge_levels(p_s)
+    baseline = min(left, right)
+
+    prof = p_s - baseline
+    prof = np.maximum(prof, 0.0)
+    prof = moving_average(prof, MA_W_D)
+    prof = np.maximum(prof, 0.0)
+
+    if np.max(prof) > 0:
+        prof = np.where(prof >= 0.03 * np.max(prof), prof, 0.0)
+
+    dx = float(np.median(np.diff(x_mm)))
+    P_rise = np.cumsum(prof) * dx
+    P_rise = normalize_01(P_rise)
+
+    P = 1.0 - P_rise
+    P = moving_average(P, MA_W_P)
+    P = np.clip(P, 0.0, 1.0)
+
+    return P, prof
+
+
+def crossing_x_at_level(x, y, level=0.5):
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+
+    if len(x) < 2:
+        return 0.0
+
+    s = y - level
+    idx = np.where(np.signbit(s[:-1]) != np.signbit(s[1:]))[0]
+    if len(idx) == 0:
+        return float(x[np.argmin(np.abs(s))])
+
+    i = idx[0]
+    x0, x1 = x[i], x[i + 1]
+    y0, y1 = y[i], y[i + 1]
+
+    if abs(y1 - y0) < 1e-12:
+        return float(x0)
+
+    return float(x0 + (level - y0) * (x1 - x0) / (y1 - y0))
+
+
+def weighted_stats_from_profile(x, prof):
+    x = np.asarray(x, float)
+    prof = np.asarray(prof, float)
+
+    prof = np.maximum(prof, 0.0)
+    s = float(np.sum(prof))
+    if s <= 0 or len(x) < 3:
+        return None, None, None
+
+    mu = float(np.sum(x * prof) / s)
+    var = float(np.sum(prof * (x - mu) ** 2) / s)
+    sigma = float(np.sqrt(max(var, 0.0)))
+    width_4sigma = 4.0 * sigma
+    return mu, sigma, width_4sigma
+
+
+def crop_main_lobe(x, profile, half_win_mm=PROFILE_HALF_WIN_MM, thresh_frac=PROFILE_THRESH_FRAC):
+    x = np.asarray(x, float)
+    profile = np.asarray(profile, float)
+
+    if len(x) < 5:
+        return x, profile
+
+    profile = np.maximum(profile, 0.0)
+    i_peak = int(np.argmax(profile))
+    x_peak = x[i_peak]
+    p_peak = profile[i_peak]
+
+    if p_peak <= 0:
+        return x, profile
+
+    keep = (x >= (x_peak - half_win_mm)) & (x <= (x_peak + half_win_mm))
+    x_c = x[keep]
+    p_c = profile[keep]
+
+    if len(x_c) < 5:
+        return x, profile
+
+    thresh = thresh_frac * np.max(p_c)
+    p_c = np.where(p_c >= thresh, p_c, 0.0)
+    return x_c, p_c
+
+
+def process_scan(t_ms, deg, p_mw, v=None):
+    t_ms = np.asarray(t_ms, float)
+    deg = np.asarray(deg, float)
+    p_mw = np.asarray(p_mw, float)
+
+    if len(t_ms) < 10:
+        return None
+
+    t_s = (t_ms - t_ms[0]) / 1000.0
+
+    theta_rad = np.deg2rad(deg - deg[0])
+    x_mm = R_MM * theta_rad
+
+    order = np.argsort(x_mm)
+    x_mm = x_mm[order]
+    t_s = t_s[order]
+    deg = deg[order]
+    p_mw = p_mw[order]
+
+    if v is None or len(v) != len(p_mw):
+        v_s = p_mw.copy()
+    else:
+        v_s = moving_average(np.asarray(v, float)[order], MA_W_V)
+
+    p_s = moving_average(p_mw, MA_W_P)
+
+    if len(x_mm) < 3:
+        return None
+
+    dx = float(np.median(np.diff(x_mm)))
+    if abs(dx) < 1e-12:
+        return None
+
+    monotonic_mode = is_mostly_monotonic(p_s)
+
+    if monotonic_mode:
+        P = knife_from_monotonic_power(p_s)
+
+        dPdx = np.gradient(P, dx)
+        profile_full = -dPdx
+        profile_full = profile_full - np.min(profile_full)
+        profile_full = np.maximum(profile_full, 0.0)
+        profile_full = moving_average(profile_full, MA_W_D)
+        profile_full = np.maximum(profile_full, 0.0)
+    else:
+        P, profile_full = profile_from_hump_power(x_mm, p_s)
+
+    if np.max(profile_full) > 0:
+        profile_full = np.where(profile_full >= 0.04 * np.max(profile_full), profile_full, 0.0)
+
+    x_prof, profile = crop_main_lobe(x_mm, profile_full)
+    mu, sigma, width_4sigma = weighted_stats_from_profile(x_prof, profile)
+
+    x_center = crossing_x_at_level(x_mm, P, 0.5)
+    x_mm_rel = x_mm - x_center
+
+    if mu is not None:
+        x_prof_centered = x_prof - mu
+    else:
+        x_prof_centered = x_prof - x_center
+
+    return {
+        "t_s": t_s,
+        "x_mm": x_mm_rel,
+        "deg": deg,
+        "v_s": v_s,
+        "p_mw": p_s,
+        "P": P,
+        "profile_full": profile_full,
+        "x_prof": x_prof_centered,
+        "profile": profile,
+        "mu": mu,
+        "sigma": sigma,
+        "width_4sigma": width_4sigma,
+        "x_center": x_center,
+        "mode": "knife_edge" if monotonic_mode else "profile_integrated",
+    }
+
+def average_processed_scans(results):
+    if not results:
+        return None
+    if len(results) == 1:
+        return results[0]
+
+    x0 = max(r["x_mm"][0] for r in results)
+    x1 = min(r["x_mm"][-1] for r in results)
+    if x1 <= x0:
+        return None
+
+    n = min(len(r["x_mm"]) for r in results)
+    x_common = np.linspace(x0, x1, n)
+
+    v_stack = []
+    p_stack = []
+    P_stack = []
+    prof_stack = []
+    t_stack = []
+
+    for r in results:
+        v_stack.append(np.interp(x_common, r["x_mm"], r["v_s"]))
+        p_stack.append(np.interp(x_common, r["x_mm"], r["p_mw"]))
+        P_stack.append(np.interp(x_common, r["x_mm"], r["P"]))
+        prof_stack.append(np.interp(x_common, r["x_mm"], r["profile_full"]))
+        t_stack.append(np.interp(x_common, r["x_mm"], r["t_s"]))
+
+    v_avg = np.mean(np.vstack(v_stack), axis=0)
+    p_avg = np.mean(np.vstack(p_stack), axis=0)
+    P_avg = np.mean(np.vstack(P_stack), axis=0)
+    prof_full_avg = np.mean(np.vstack(prof_stack), axis=0)
+    t_avg = np.mean(np.vstack(t_stack), axis=0)
+
+    x_prof, prof_avg = crop_main_lobe(x_common, prof_full_avg)
+    mu, sigma, width_4sigma = weighted_stats_from_profile(x_prof, prof_avg)
+    x_prof_centered = x_prof - mu if mu is not None else x_prof
+
+    return {
+        "t_s": t_avg,
+        "x_mm": x_common,
+        "deg": None,
+        "v_s": v_avg,
+        "p_mw": p_avg,
+        "P": P_avg,
+        "profile_full": prof_full_avg,
+        "x_prof": x_prof_centered,
+        "profile": prof_avg,
+        "mu": mu,
+        "sigma": sigma,
+        "width_4sigma": width_4sigma,
+        "x_center": 0.0,
+        "mode": "avg",
+    }
+    
+
+def parse_profile_begin_axis(line):
+    # Example:
+    # PROFILE_BEGIN,axis=0,omega=...,initial_ms=...,ts_ms=...,t90_s=...,twait_s=...
+    if not line.startswith("PROFILE_BEGIN"):
+        return None
+
+    parts = line.split(",")
+    for part in parts:
+        if part.startswith("axis="):
+            try:
+                return int(part.split("=")[1])
+            except Exception:
+                return None
+    return None
+
+
+def parse_profile_axis_done(line):
+    # Example:
+    # PROFILE_AXIS_DONE,axis=0
+    if not line.startswith("PROFILE_AXIS_DONE"):
+        return None
+
+    parts = line.split(",")
+    for part in parts:
+        if part.startswith("axis="):
+            try:
+                return int(part.split("=")[1])
+            except Exception:
+                return None
+    return None
+
+# ============================================================
+# Fake serial data generator
+# ============================================================
+def make_fake_scan_lines(run_index=0):
+    lines = []
+
+    # include scan 0 + 10 repeated scans
+    for scan_no in range(11):
+        dt_ms = 8
+        total_ms = 1000 if scan_no == 0 else 180
+        n = total_ms // dt_ms + 1
+
+        v_lo = 0.08
+        v_hi = 0.80
+
+        for i in range(n):
+            t_ms = i * dt_ms
+            deg = 25.0 * (t_ms / max(total_ms, 1))
+
+            t0 = 95.0 + 1.0 * np.random.randn()
+            k = 10.0 + 0.5 * np.random.randn()
+            p_norm = 1.0 / (1.0 + math.exp((t_ms - t0) / max(k, 1.0)))
+
+            noise = np.random.normal(0.0, 0.004)
+            ripple = 0.003 * math.sin(2.0 * math.pi * t_ms / 40.0)
+
+            v = v_lo + (v_hi - v_lo) * p_norm + noise + ripple
+            v = max(0.0, v)
+
+            stage = 1
+            raw = int(np.clip((v / 3.3) * 4095, 0, 4095))
+            p_mw = max(0.0, 3.0 * p_norm + 0.02 * np.random.randn())
+
+            lines.append(f"BM,{scan_no},{t_ms:.3f},{deg:.6f},{stage},{raw},{v:.6f},{p_mw:.6f}")
+
+        lines.append("BM_DONE")
+
+    lines.append("PROFILE_DONE")
+    return lines
+
+
+def send_fake_scan(run_index=0):
+    lines = make_fake_scan_lines(run_index=run_index)
+
+    def worker():
+        try:
+            rx_q.put_nowait("PROFILE_BEGIN,omega=1.1000,initial_ms=1000,ts_ms=180,t90_s=1.42,twait_s=1.24")
+        except queue.Full:
+            pass
+
+        for line in lines:
+            if stop_reader:
+                return
+            if sess.abort or not sess.active:
+                return
+
+            try:
+                rx_q.put_nowait(line)
+            except queue.Full:
+                pass
+
+            time.sleep(0.01)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ============================================================
+# Serial reader thread
+# ============================================================
+rx_q = queue.Queue(maxsize=50000)
+stop_reader = False
+
+if not USE_FAKE_SERIAL:
+    ser = serial.Serial(PORT, BAUD, timeout=0.1)
+else:
+    ser = None
+
+
+def reader_thread():
+    global stop_reader
+
+    if USE_FAKE_SERIAL:
+        while not stop_reader:
+            time.sleep(0.05)
+        return
+
+    buf = b""
+    while not stop_reader:
+        try:
+            data = ser.read(ser.in_waiting or 1)
+            if not data:
+                continue
+
+            buf += data
+
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                s = line.decode(errors="ignore").strip()
+                try:
+                    rx_q.put_nowait(s)
+                except queue.Full:
+                    try:
+                        rx_q.get_nowait()
+                    except queue.Empty:
+                        pass
+        except Exception:
+            pass
+
+
+threading.Thread(target=reader_thread, daemon=True).start()
+
+# ============================================================
+# Session state
+# ============================================================
+class Session:
+    def __init__(self):
+        self.active = False
+        self.abort = False
+
+        # target number of full STM32 PROFILE runs
+        self.target_runs = 1
+        self.done_runs = 0
+
+        # current active axis from STM32 messages
+        self.current_axis = None
+
+        # current raw scan buffers
+        self.cur_scan_no = None
+        self.cur_t_ms = []
+        self.cur_deg = []
+        self.cur_v = []
+        self.cur_raw = []
+        self.cur_p_mw = []
+        self.cur_stage = []
+
+        # repeated raw scans grouped by axis for current run
+        self.raw_scans_current_run = {0: [], 1: []}
+
+        # repeated raw scans grouped by axis across all runs
+        self.raw_scans_all = {0: [], 1: []}
+
+        # processed repeated scans grouped by axis for current run
+        self.processed_scans_current_run = {0: [], 1: []}
+
+        # averaged result for each completed run, grouped by axis
+        self.run_results = {0: [], 1: []}
+
+        # currently displayed result by axis
+        self.last_result = {0: None, 1: None}
+
+        # which axis to show in the plots
+        self.display_axis = 0
+
+        self.scan_start_wall = None
+        self.last_bm_wall = None
+
+sess = Session()
+
+
+def flush_rx():
+    while True:
+        try:
+            rx_q.get_nowait()
+        except queue.Empty:
+            break
+
+
+def reset_current_scan_buffers():
+    sess.cur_scan_no = None
+    sess.cur_t_ms.clear()
+    sess.cur_deg.clear()
+    sess.cur_v.clear()
+    sess.cur_raw.clear()
+    sess.cur_p_mw.clear()
+    sess.cur_stage.clear()
+
+
+def start_session(target_runs=1):
+    sess.active = True
+    sess.abort = False
+
+    sess.target_runs = target_runs
+    sess.done_runs = 0
+    sess.current_axis = None
+
+    sess.raw_scans_current_run = {0: [], 1: []}
+    sess.raw_scans_all = {0: [], 1: []}
+
+    sess.processed_scans_current_run = {0: [], 1: []}
+    sess.run_results = {0: [], 1: []}
+
+    sess.last_result = {0: None, 1: None}
+    sess.display_axis = 0
+
+    sess.scan_start_wall = time.time()
+    sess.last_bm_wall = None
+
+    reset_current_scan_buffers()
+    flush_rx()
+
+    if USE_FAKE_SERIAL:
+        send_fake_scan(run_index=0)
+    else:
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        ser.write(START_CMD)
+
+
+def start_next_profile_run():
+    sess.current_axis = None
+    sess.raw_scans_current_run = {0: [], 1: []}
+    sess.processed_scans_current_run = {0: [], 1: []}
+    sess.scan_start_wall = time.time()
+    sess.last_bm_wall = None
+    reset_current_scan_buffers()
+    flush_rx()
+
+    if USE_FAKE_SERIAL:
+        send_fake_scan(run_index=sess.done_runs)
+    else:
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        ser.write(START_CMD)
+
+
+def abort_session():
+    sess.abort = True
+    sess.active = False
+    if not USE_FAKE_SERIAL:
+        try:
+            ser.write(ABORT_CMD)
+        except Exception:
+            pass
+
+# ============================================================
+# Plotting
+# ============================================================
+fig1, ax1 = plt.subplots()
+plt.subplots_adjust(bottom=0.20)
+line_v, = ax1.plot([], [], label="Power (mW, smoothed)")
+line_p, = ax1.plot([], [], label="Normalized knife-edge")
+ax1.set_xlabel("Position x (mm)")
+ax1.set_ylabel("Power / normalized power")
+ax1.grid(True)
+ax1.legend()
+
+fig2, ax2 = plt.subplots()
+plt.subplots_adjust(bottom=0.20)
+line_prof, = ax2.plot([], [], label="Beam profile")
+ax2.set_xlabel("Position relative to centroid (mm)")
+ax2.set_ylabel("Profile amplitude")
+ax2.grid(True)
+ax2.legend()
+
+status_text = ax1.text(
+    0.02, 0.98, "", transform=ax1.transAxes, va="top", ha="left"
+)
+
+ax_btn_start = plt.axes([0.04, 0.05, 0.12, 0.075])
+ax_btn_avg   = plt.axes([0.18, 0.05, 0.12, 0.075])
+ax_btn_ax1   = plt.axes([0.32, 0.05, 0.12, 0.075])
+ax_btn_ax2   = plt.axes([0.46, 0.05, 0.12, 0.075])
+ax_btn_stop  = plt.axes([0.60, 0.05, 0.12, 0.075])
+ax_btn_save  = plt.axes([0.74, 0.05, 0.12, 0.075])
+
+btn_start = Button(ax_btn_start, "Start")
+btn_avg   = Button(ax_btn_avg, "Avg 10")
+btn_ax1   = Button(ax_btn_ax1, "Axis 1")
+btn_ax2   = Button(ax_btn_ax2, "Axis 2")
+btn_stop  = Button(ax_btn_stop, "Stop")
+btn_save  = Button(ax_btn_save, "Save CSV")
+
+btn_start.on_clicked(lambda event: start_session(target_runs=1))
+btn_avg.on_clicked(lambda event: start_session(target_runs=10))
+btn_ax1.on_clicked(lambda event: show_axis(0))
+btn_ax2.on_clicked(lambda event: show_axis(1))
+btn_stop.on_clicked(lambda event: abort_session())
+btn_save.on_clicked(lambda event: save_last_result())
+
+
+def update_plots(result):
+    if result is None:
+        return
+
+    line_v.set_data(result["x_mm"], result["p_mw"])
+    line_p.set_data(result["x_mm"], result["P"])
+    ax1.relim()
+    ax1.autoscale_view()
+
+    line_prof.set_data(result["x_prof"], result["profile"])
+    ax2.relim()
+    ax2.autoscale_view()
+
+    axis_name = "Axis 1" if sess.display_axis == 0 else "Axis 2"
+
+    if result["width_4sigma"] is not None:
+        status_text.set_text(
+            f"{axis_name}\n"
+            f"4σ width = {result['width_4sigma']:.3f} mm\n"
+            f"σ = {result['sigma']:.3f} mm\n"
+            f"mode = {result.get('mode', 'unknown')}\n"
+            f"runs = {sess.done_runs}/{sess.target_runs}"
+        )
+    else:
+        status_text.set_text(
+            f"{axis_name}\n"
+            f"mode = {result.get('mode', 'unknown')}\n"
+            f"runs = {sess.done_runs}/{sess.target_runs}"
+        )
+
+    fig1.canvas.draw_idle()
+    fig2.canvas.draw_idle()
+    
+def show_axis(axis):
+    if axis in (0, 1) and sess.last_result[axis] is not None:
+        sess.display_axis = axis
+        update_plots(sess.last_result[axis])
+    else:
+        print(f"No data available for Axis {axis + 1}")
+
+def save_axis_plot_images(axis, ts):
+    r = sess.last_result[axis]
+    if r is None:
+        return
+
+    out_dir = os.getcwd()
+    axis_label = axis + 1
+
+    # Figure 1: power + normalized knife-edge
+    fig_ke, ax_ke = plt.subplots()
+    ax_ke.plot(r["x_mm"], r["p_mw"], label="Power (mW, smoothed)")
+    ax_ke.plot(r["x_mm"], r["P"], label="Normalized knife-edge")
+    ax_ke.set_xlabel("Position x (mm)")
+    ax_ke.set_ylabel("Power / normalized power")
+    ax_ke.set_title(f"Axis {axis_label} - Knife-edge / Power")
+    ax_ke.grid(True)
+    ax_ke.legend()
+
+    if r["width_4sigma"] is not None:
+        txt = (
+            f"4σ width = {r['width_4sigma']:.3f} mm\n"
+            f"σ = {r['sigma']:.3f} mm\n"
+            f"mode = {r.get('mode', 'unknown')}"
+        )
+    else:
+        txt = f"mode = {r.get('mode', 'unknown')}"
+
+    ax_ke.text(0.02, 0.98, txt, transform=ax_ke.transAxes, va="top", ha="left")
+
+    path_ke = os.path.join(out_dir, f"beam_profile_axis{axis_label}_knifeedge_{ts}.png")
+    fig_ke.savefig(path_ke, dpi=200, bbox_inches="tight")
+    plt.close(fig_ke)
+    print("Saved plot:", path_ke)
+
+    # Figure 2: beam profile
+    fig_bp, ax_bp = plt.subplots()
+    ax_bp.plot(r["x_prof"], r["profile"], label="Beam profile")
+    ax_bp.set_xlabel("Position relative to centroid (mm)")
+    ax_bp.set_ylabel("Profile amplitude")
+    ax_bp.set_title(f"Axis {axis_label} - Beam Profile")
+    ax_bp.grid(True)
+    ax_bp.legend()
+
+    if r["width_4sigma"] is not None:
+        ax_bp.text(
+            0.02, 0.98,
+            f"4σ width = {r['width_4sigma']:.3f} mm\n"
+            f"σ = {r['sigma']:.3f} mm",
+            transform=ax_bp.transAxes,
+            va="top",
+            ha="left"
+        )
+
+    path_bp = os.path.join(out_dir, f"beam_profile_axis{axis_label}_profile_{ts}.png")
+    fig_bp.savefig(path_bp, dpi=200, bbox_inches="tight")
+    plt.close(fig_bp)
+    print("Saved plot:", path_bp)
+
+
+def save_all_scan_plot_images():
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for axis in (0, 1):
+        save_axis_plot_images(axis, ts)
+
+def save_all_scans_csv():
+    out_dir = os.getcwd()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for axis in (0, 1):
+        if not sess.raw_scans_all[axis]:
+            continue
+
+        path = os.path.join(out_dir, f"beam_profiles_axis{axis+1}_{ts}.csv")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("axis,scan_no,point_idx,t_ms,deg,stage,raw,v,p_mw\n")
+
+            for scan in sess.raw_scans_all[axis]:
+                n = len(scan["t_ms"])
+                for i in range(n):
+                    f.write(
+                        f"{scan['axis']},"
+                        f"{scan['scan_no']},"
+                        f"{i},"
+                        f"{scan['t_ms'][i]:.6f},"
+                        f"{scan['deg'][i]:.6f},"
+                        f"{scan['stage'][i]},"
+                        f"{scan['raw'][i]},"
+                        f"{scan['v'][i]:.6f},"
+                        f"{scan['p_mw'][i]:.6f}\n"
+                    )
+
+        print("Saved repeated beam profiles:", path)
+
+
+def save_last_result():
+    out_dir = os.getcwd()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for axis in (0, 1):
+        r = sess.last_result[axis]
+        if r is None:
+            continue
+
+        avg_path = os.path.join(out_dir, f"beam_profile_axis{axis+1}_avg_{ts}.csv")
+
+        n1 = len(r["x_mm"])
+        n2 = len(r["x_prof"])
+
+        with open(avg_path, "w", encoding="utf-8") as f:
+            f.write(f"# axis,{axis}\n")
+            f.write(f"# 4sigma_width_mm,{r['width_4sigma']}\n")
+            f.write(f"# sigma_mm,{r['sigma']}\n")
+            f.write(f"# mu_mm,{r['mu']}\n")
+            f.write("x_mm,signal_smoothed,power_mw_smoothed,normalized_power,profile_x_mm,beam_profile\n")
+
+            for i in range(max(n1, n2)):
+                c1 = ""
+                c2 = ""
+                c3 = ""
+                c4 = ""
+                c5 = ""
+                c6 = ""
+
+                if i < n1:
+                    c1 = f"{r['x_mm'][i]:.6f}"
+                    c2 = f"{r['v_s'][i]:.6f}"
+                    c3 = f"{r['p_mw'][i]:.6f}"
+                    c4 = f"{r['P'][i]:.6f}"
+
+                if i < n2:
+                    c5 = f"{r['x_prof'][i]:.6f}"
+                    c6 = f"{r['profile'][i]:.6f}"
+
+                f.write(f"{c1},{c2},{c3},{c4},{c5},{c6}\n")
+
+        print("Saved averaged result:", avg_path)
+
+    save_all_scans_csv()
+    save_all_scan_plot_images()
+
+
+btn_start.on_clicked(lambda event: start_session(target_runs=1))
+btn_avg.on_clicked(lambda event: start_session(target_runs=10))
+btn_stop.on_clicked(lambda event: abort_session())
+btn_save.on_clicked(lambda event: save_last_result())
+
+# ============================================================
+# Main UI/update loop
+# ============================================================
+def finalize_current_scan():
+    if not sess.cur_t_ms or sess.current_axis is None:
+        return
+
+    raw_scan = {
+        "axis": sess.current_axis,
+        "scan_no": sess.cur_scan_no,
+        "t_ms": np.array(sess.cur_t_ms, dtype=float),
+        "deg": np.array(sess.cur_deg, dtype=float),
+        "v": np.array(sess.cur_v, dtype=float),
+        "raw": np.array(sess.cur_raw, dtype=int),
+        "p_mw": np.array(sess.cur_p_mw, dtype=float),
+        "stage": np.array(sess.cur_stage, dtype=int),
+    }
+
+    # Skip scan 0 (initial long scan), save repeated scans only
+    if sess.cur_scan_no != 0:
+        sess.raw_scans_current_run[sess.current_axis].append(raw_scan)
+        sess.raw_scans_all[sess.current_axis].append(raw_scan)
+
+    if sess.cur_p_mw:
+        result = process_scan(sess.cur_t_ms, sess.cur_deg, sess.cur_p_mw, sess.cur_v)
+    else:
+        if not sess.cur_v:
+            reset_current_scan_buffers()
+            return
+        result = process_scan(sess.cur_t_ms, sess.cur_deg, sess.cur_v, sess.cur_v)
+
+    if result is not None and sess.cur_scan_no != 0:
+        sess.processed_scans_current_run[sess.current_axis].append(result)
+
+        avg_result = average_processed_scans(sess.processed_scans_current_run[sess.current_axis])
+        if avg_result is not None:
+            sess.last_result[sess.current_axis] = avg_result
+            sess.display_axis = sess.current_axis
+            update_plots(sess.last_result[sess.current_axis])
+
+    reset_current_scan_buffers()
+
+
+def finalize_current_run():
+    for axis in (0, 1):
+        if sess.processed_scans_current_run[axis]:
+            run_avg = average_processed_scans(sess.processed_scans_current_run[axis])
+            if run_avg is not None:
+                sess.run_results[axis].append(run_avg)
+                sess.last_result[axis] = run_avg
+
+    sess.done_runs += 1
+
+    if sess.target_runs > 1:
+        for axis in (0, 1):
+            if sess.run_results[axis]:
+                grand_avg = average_processed_scans(sess.run_results[axis])
+                if grand_avg is not None:
+                    sess.last_result[axis] = grand_avg
+
+    # default display: show axis 0 if available, otherwise axis 1
+    if sess.last_result[0] is not None:
+        sess.display_axis = 0
+        update_plots(sess.last_result[0])
+    elif sess.last_result[1] is not None:
+        sess.display_axis = 1
+        update_plots(sess.last_result[1])
+
+
+def pump_serial():
+    did_work = False
+
+    while True:
+        try:
+            line = rx_q.get_nowait()
+        except queue.Empty:
+            break
+
+        did_work = True
+        print(line)
+
+        if line == "BM_DONE":
+            if sess.cur_t_ms:
+                finalize_current_scan()
+            continue
+
+        axis_from_begin = parse_profile_begin_axis(line)
+        if axis_from_begin is not None:
+            sess.current_axis = axis_from_begin
+            reset_current_scan_buffers()
+            continue
+
+        axis_done = parse_profile_axis_done(line)
+        if axis_done is not None:
+            print(f"Axis {axis_done} complete")
+
+            # 🔴 FINALIZE any in-progress scan for that axis
+            if sess.current_axis == axis_done and sess.cur_t_ms:
+                finalize_current_scan()
+
+            # Optional: reset current scan buffer for safety
+            reset_current_scan_buffers()
+
+            continue
+
+        if line.startswith("PROFILE_T0") or line.startswith("PROFILE_SCAN_"):
+            continue
+
+        if line == "PROFILE_DONE":
+            if sess.cur_t_ms:
+                finalize_current_scan()
+
+            finalize_current_run()
+
+            if sess.abort:
+                sess.active = False
+            elif sess.done_runs < sess.target_runs:
+                start_next_profile_run()
+            else:
+                sess.active = False
+
+            continue
+
+        if line == "PROFILE_ABORT":
+            sess.active = False
+            continue
+
+        parsed = parse_bm(line)
+        if parsed is None:
+            continue
+
+        if parsed["kind"] == "BM":
+            sess.last_bm_wall = time.time()
+
+            axis = parsed["axis"]
+            scan_no = parsed["scan"]
+
+            # Use axis from BM line directly
+            if sess.current_axis is None:
+                sess.current_axis = axis
+
+            # If axis changes mid-stream, finalize previous scan first
+            if axis != sess.current_axis and sess.cur_t_ms:
+                finalize_current_scan()
+                reset_current_scan_buffers()
+                sess.current_axis = axis
+
+            if sess.cur_scan_no is None:
+                sess.cur_scan_no = scan_no
+            elif scan_no != sess.cur_scan_no and sess.cur_t_ms:
+                finalize_current_scan()
+                sess.cur_scan_no = scan_no
+
+            sess.cur_t_ms.append(parsed["t_ms"])
+            sess.cur_deg.append(parsed["deg"])
+            sess.cur_v.append(parsed["v"])
+            sess.cur_raw.append(parsed["raw"])
+            sess.cur_p_mw.append(parsed["p_mw"])
+            sess.cur_stage.append(parsed["stage"])
+
+    return did_work
+
+
+timer = fig1.canvas.new_timer(interval=50)
+
+def on_timer():
+    pump_serial()
+
+    if sess.active:
+        if sess.last_bm_wall is not None:
+            if (time.time() - sess.last_bm_wall) > STALL_TIMEOUT_S:
+                print("Stall timeout: BM stream stopped.")
+                sess.active = False
+        elif sess.scan_start_wall is not None:
+            if (time.time() - sess.scan_start_wall) > 5.0:
+                print("Timeout: PROFILE started but no BM data arrived.")
+                sess.active = False
+
+
+timer.add_callback(on_timer)
+timer.start()
+
+plt.show()
+
+stop_reader = True
+if ser is not None:
+    try:
+        ser.close()
+    except Exception:
+        pass

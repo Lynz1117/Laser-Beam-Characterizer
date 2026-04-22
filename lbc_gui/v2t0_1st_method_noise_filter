@@ -1,0 +1,224 @@
+import os
+from datetime import datetime
+
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+from scipy.special import erf
+
+PORT = "COM7"
+BAUD = 115200
+CMD = b"T0M1\n"   # change to b"T0M2\n" for motor 2
+
+RPM = 10.0
+R_MM = 25.0
+TIMEOUT_S = 2.0
+SAVE_DIR = "t0_scans_ma_erf"
+SMOOTH_WIN = 101   # must be odd
+
+
+def moving_average_same(x, win):
+    if win < 1:
+        win = 1
+    if win % 2 == 0:
+        win += 1
+    kernel = np.ones(win, dtype=float) / win
+    return np.convolve(x, kernel, mode="same")
+
+
+def erf_model(x, a, x0, w, c):
+    w = max(abs(w), 1e-9)
+    return c + a * 0.5 * (1.0 + erf((x - x0) / w))
+
+
+def initial_guess(x, y):
+    y_min = float(np.min(y))
+    y_max = float(np.max(y))
+    a0 = y_max - y_min
+    c0 = y_min
+    y_mid = c0 + 0.5 * a0
+
+    idx_mid = int(np.argmin(np.abs(y - y_mid)))
+    x0 = x[idx_mid]
+
+    y10 = c0 + 0.1 * a0
+    y90 = c0 + 0.9 * a0
+    idx10 = int(np.argmin(np.abs(y - y10)))
+    idx90 = int(np.argmin(np.abs(y - y90)))
+    width_est = abs(x[idx90] - x[idx10])
+    if width_est <= 1e-9:
+        width_est = max((x[-1] - x[0]) / 20.0, 1e-3)
+
+    w0 = width_est / 2.0
+    return [a0, x0, w0, c0]
+
+
+def fit_erf_curve(x, y):
+    p0 = initial_guess(x, y)
+    popt, pcov = curve_fit(erf_model, x, y, p0=p0, maxfev=20000)
+    return popt, pcov
+
+
+ser = serial.Serial(PORT, BAUD, timeout=TIMEOUT_S)
+ser.reset_input_buffer()
+ser.reset_output_buffer()
+
+t_ms = []
+p_raw = []
+
+axis = None
+t0_ms_stm = None
+t0_idx_stm = None
+t0_p_stm = None
+fs_hz = 10000.0
+stage_used = None
+
+print(f"Sending {CMD!r} ...")
+ser.write(CMD)
+
+while True:
+    line = ser.readline().decode(errors="ignore").strip()
+    if not line:
+        continue
+
+    print(line)
+
+    if line.startswith("T0_RESULT"):
+        parts = {}
+        for item in line.split(",")[1:]:
+            if "=" in item:
+                k, v = item.split("=", 1)
+                parts[k] = v
+        axis = int(parts["axis"])
+        t0_idx_stm = int(parts["idx"])
+        t0_ms_stm = float(parts["t0_ms"])
+        if "P" in parts:
+            t0_p_stm = float(parts["P"])
+        if "stage" in parts:
+            stage_used = int(parts["stage"])
+
+    elif line.startswith("T0_RAW_BEGIN"):
+        parts = {}
+        for item in line.split(",")[1:]:
+            if "=" in item:
+                k, v = item.split("=", 1)
+                parts[k] = v
+        axis = int(parts["axis"])
+        fs_hz = float(parts["fs"])
+        if "stage" in parts:
+            stage_used = int(parts["stage"])
+
+    elif line.startswith("RAW,"):
+        parts = line.split(",")
+        axis = int(parts[1])
+        tm = float(parts[3])
+        raw_power = float(parts[4])
+        t_ms.append(tm)
+        p_raw.append(raw_power)
+
+    elif line.startswith("T0_RAW_DONE"):
+        break
+
+ser.close()
+
+t_ms = np.array(t_ms, dtype=float)
+p_raw = np.array(p_raw, dtype=float)
+
+if len(t_ms) == 0:
+    raise RuntimeError("No RAW samples received from STM32.")
+
+omega_rad_s = 2.0 * np.pi * RPM / 60.0
+theta_rad = omega_rad_s * (t_ms / 1000.0)
+theta_deg = np.degrees(theta_rad)
+x_mm = R_MM * theta_rad
+
+p_filt = moving_average_same(p_raw, SMOOTH_WIN)
+abs_dpdx = np.abs(np.gradient(p_filt, x_mm))
+
+popt, pcov = fit_erf_curve(x_mm, p_filt)
+a_fit, x0_fit, w_fit, c_fit = popt
+p_fit = erf_model(x_mm, *popt)
+
+x_t0_mm = None
+theta_t0_deg = None
+if t0_ms_stm is not None:
+    t0_s = t0_ms_stm / 1000.0
+    theta_t0_deg = np.degrees(omega_rad_s * t0_s)
+    x_t0_mm = R_MM * omega_rad_s * t0_s
+
+print("\n----- MOVING AVERAGE + ERF FIT SUMMARY -----")
+print(f"Axis: {axis}")
+print(f"Samples received: {len(p_raw)}")
+print(f"Sample rate: {fs_hz:.1f} Hz")
+print(f"Gain stage used: {stage_used}")
+print(f"STM32 T0 index: {t0_idx_stm}")
+print(f"STM32 T0 time:  {t0_ms_stm}")
+print(f"STM32 T0 power: {t0_p_stm}")
+print(f"ERF fit center x0: {x0_fit:.6f} mm")
+print(f"ERF fit width w:   {w_fit:.6f} mm")
+
+os.makedirs(SAVE_DIR, exist_ok=True)
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+axis_str = "unknown" if axis is None else str(axis)
+base = os.path.join(SAVE_DIR, f"axis{axis_str}_ma_erf_{timestamp}")
+
+csv_file = base + ".csv"
+header_lines = [
+    f"axis,{axis}",
+    f"sample_rate_hz,{fs_hz}",
+    f"rpm,{RPM}",
+    f"radius_mm,{R_MM}",
+    f"gain_stage,{stage_used}",
+    f"stm_t0_idx,{t0_idx_stm}",
+    f"stm_t0_ms,{t0_ms_stm}",
+    f"stm_t0_power_mw,{t0_p_stm}",
+    f"stm_t0_position_mm,{x_t0_mm}",
+    f"erf_a,{a_fit}",
+    f"erf_x0_mm,{x0_fit}",
+    f"erf_w_mm,{w_fit}",
+    f"erf_c,{c_fit}",
+    "index,time_ms,theta_deg,position_mm,power_raw_mW,power_filtered_mW,power_fit_mW,abs_dPdx",
+]
+header = "\n".join(header_lines)
+
+data = np.column_stack((
+    np.arange(len(t_ms)),
+    t_ms,
+    theta_deg,
+    x_mm,
+    p_raw,
+    p_filt,
+    p_fit,
+    abs_dpdx
+))
+np.savetxt(csv_file, data, delimiter=",", header=header, comments="")
+print(f"Saved data -> {csv_file}")
+
+plt.figure()
+plt.plot(x_mm, p_raw, label="Raw Power")
+plt.plot(x_mm, p_filt, label="Moving Avg Power")
+plt.plot(x_mm, p_fit, label="ERF Fit")
+if x_t0_mm is not None:
+    plt.axvline(x_t0_mm, linestyle="--", linewidth=2, label=f"STM32 T0 = {x_t0_mm:.3f} mm")
+plt.axvline(x0_fit, linestyle=":", linewidth=2, label=f"Fit x0 = {x0_fit:.3f} mm")
+plt.xlabel("Position (mm)")
+plt.ylabel("Power (mW)")
+plt.title(f"Moving Average + ERF Fit - Axis {axis}")
+plt.legend()
+plt.grid(True)
+plt.savefig(base + "_position.png", dpi=300, bbox_inches="tight")
+
+plt.figure()
+plt.plot(x_mm, abs_dpdx, label="|dP_filtered/dx|")
+if x_t0_mm is not None:
+    plt.axvline(x_t0_mm, linestyle="--", linewidth=2, label=f"STM32 T0 = {x_t0_mm:.3f} mm")
+plt.axvline(x0_fit, linestyle=":", linewidth=2, label=f"Fit x0 = {x0_fit:.3f} mm")
+plt.xlabel("Position (mm)")
+plt.ylabel("Absolute derivative")
+plt.title(f"Moving Average Derivative - Axis {axis}")
+plt.legend()
+plt.grid(True)
+plt.savefig(base + "_derivative.png", dpi=300, bbox_inches="tight")
+
+plt.show()

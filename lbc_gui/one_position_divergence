@@ -1,0 +1,714 @@
+"""
+step_divergence.py
+==================
+Companion script for run_step_divergence() on the STM32.
+
+STM32 flow (single position, one scan per axis):
+    STEP_DIV_BEGIN
+    STEP_DIV_POS_BEGIN
+    STEP_DIV_AXIS_BEGIN  axis=0
+    RAW_SCAN_BEGIN / RAW_SCAN ... / RAW_SCAN_DONE
+    T0_RESULT   axis=0
+    STEP_DIV_AXIS_RESULT  axis=0
+    STEP_DIV_AXIS_BEGIN  axis=1
+    RAW_SCAN_BEGIN / RAW_SCAN ... / RAW_SCAN_DONE
+    T0_RESULT   axis=1
+    STEP_DIV_AXIS_RESULT  axis=1
+    STEP_DIV_POS_DONE
+    STEP_DIV_DONE
+
+Output per axis:
+    axis<n>_z<z>mm.csv
+    axis<n>_z<z>mm_power_vs_angle.png
+    axis<n>_z<z>mm_derivative_vs_angle.png
+    axis<n>_z<z>mm_overlay.png
+    axis<n>_z<z>mm_beam_profile.png
+    step_divergence_summary.csv  (one row per axis)
+
+Usage
+-----
+    Adjust PORT / BAUD / SAVE_DIR then run:
+        python step_divergence.py
+"""
+
+import os
+import math
+import csv
+from datetime import datetime
+
+import serial
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")   # swap to "TkAgg" for live windows
+import matplotlib.pyplot as plt
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+PORT     = "COM9"
+BAUD     = 115200
+CMD      = b"STEPDIV\n"
+SAVE_DIR = "step_divergence_runs"
+
+ADC_FS_HZ        = 10_000.0
+RAW_SAMPLE_DT_S  = 1.0 / ADC_FS_HZ
+SERIAL_TIMEOUT_S = 1.0
+EMPTY_LIMIT      = 5_000   # consecutive empty readline() calls before abort
+
+# ---------------------------------------------------------------------------
+# Bad-scan detection thresholds
+# ---------------------------------------------------------------------------
+MIN_VALID_DEG_SPAN = 10.0    # degrees
+MIN_VALID_AMP_MW   = 0.005   # mW
+MAX_VALID_SIGMA_MM = 5.0     # mm
+
+
+# ===========================================================================
+# Signal-processing helpers  (identical to t0_erf_runs script)
+# ===========================================================================
+
+def sg_smooth_5point(y: np.ndarray) -> np.ndarray:
+    y  = np.asarray(y, dtype=float)
+    n  = len(y)
+    if n < 5:
+        return y.copy()
+    ys = y.copy()
+    for i in range(2, n - 2):
+        ys[i] = (
+            -3.0 * y[i - 2]
+            + 12.0 * y[i - 1]
+            + 17.0 * y[i]
+            + 12.0 * y[i + 1]
+            - 3.0 * y[i + 2]
+        ) / 35.0
+    return ys
+
+
+def erf_model_idx(x_idx, x0_idx, w_idx, y_lo, y_hi) -> np.ndarray:
+    w_idx = max(float(w_idx), 1e-9)
+    a     = 0.5 * (y_hi - y_lo)
+    x_idx = np.asarray(x_idx, dtype=float)
+    z     = (x_idx - float(x0_idx)) / w_idx
+    erf_v = np.array([math.erf(v) for v in z], dtype=float)
+    return 0.5 * (y_hi + y_lo) + a * erf_v
+
+
+def estimate_erf_initial_params(y):
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if n < 2:
+        v = float(y[0]) if n else 0.0
+        return 0.0, 2.0, v, v
+
+    k    = max(3, n // 10)
+    y_lo = float(np.median(y[:k]))
+    y_hi = float(np.median(y[-k:]))
+
+    y_mid  = 0.5 * (y_lo + y_hi)
+    x0_idx = float(np.arange(n)[np.argmin(np.abs(y - y_mid))])
+
+    dy   = np.gradient(y)
+    peak = float(np.max(np.abs(dy))) if len(dy) else 0.0
+    amp  = abs(y_hi - y_lo)
+
+    if peak > 1e-12 and amp > 1e-12:
+        w_idx = max((0.5 * amp * (2.0 / math.sqrt(math.pi))) / peak, 2.0)
+    else:
+        w_idx = max(n / 20.0, 2.0)
+
+    return x0_idx, w_idx, y_lo, y_hi
+
+
+def fit_erf_curve_simple(y, max_iters: int = 80) -> dict:
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    x = np.arange(n, dtype=float)
+
+    x0, w, y_lo, y_hi = estimate_erf_initial_params(y)
+
+    def sse(p):
+        px0, pw, py_lo, py_hi = p
+        if pw < 1e-6:
+            return 1e30
+        e = y - erf_model_idx(x, px0, pw, py_lo, py_hi)
+        return float(np.dot(e, e))
+
+    params = [x0, w, y_lo, y_hi]
+    best   = sse(params)
+
+    sx = max(8.0, n * 0.03)
+    sw = max(4.0, n * 0.02)
+    sy = max(1e-6, 0.05 * max(abs(y_hi - y_lo), 1e-6))
+
+    for _ in range(max_iters):
+        improved   = False
+        candidates = [
+            [params[0] + sx,            params[1],        params[2],      params[3]],
+            [params[0] - sx,            params[1],        params[2],      params[3]],
+            [params[0],            params[1] + sw,        params[2],      params[3]],
+            [params[0], max(2.0, params[1] - sw),         params[2],      params[3]],
+            [params[0],            params[1],        params[2] + sy,      params[3]],
+            [params[0],            params[1],        params[2] - sy,      params[3]],
+            [params[0],            params[1],        params[2],      params[3] + sy],
+            [params[0],            params[1],        params[2],      params[3] - sy],
+        ]
+        for cand in candidates:
+            val = sse(cand)
+            if val < best:
+                params, best, improved = cand, val, True
+        if not improved:
+            sx *= 0.5;  sw *= 0.5;  sy *= 0.5
+            if sx < 0.05 and sw < 0.05 and sy < 1e-6:
+                break
+
+    return {
+        "x0_idx": float(params[0]),
+        "w_idx":  max(float(params[1]), 2.0),
+        "y_lo":   float(params[2]),
+        "y_hi":   float(params[3]),
+        "sse":    float(best),
+    }
+
+
+def build_erf_fit_and_derivative(n, dt_s, x0_idx, w_idx, y_lo, y_hi):
+    x     = np.arange(n, dtype=float)
+    w_idx = max(float(w_idx), 1e-9)
+    a     = 0.5 * (y_hi - y_lo)
+    z     = (x - float(x0_idx)) / w_idx
+    fit_y = erf_model_idx(x, x0_idx, w_idx, y_lo, y_hi)
+    fit_d = a * (2.0 / math.sqrt(math.pi)) * np.exp(-(z * z)) / (w_idx * dt_s)
+    return fit_y, fit_d
+
+
+# ===========================================================================
+# Raw-scan collector
+# ===========================================================================
+
+class RawScanCollector:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.axis         = None
+        self.scan_no      = None
+        self.idx          = []
+        self.enc          = []
+        self.deg          = []
+        self.x_mm         = []
+        self.stage        = []
+        self.raw          = []
+        self.v            = []
+        self.p_mw         = []
+        self.sample_dt_ms = 1000.0 * RAW_SAMPLE_DT_S
+
+    def start(self, axis, scan_no, sample_dt_ms=None):
+        self.reset()
+        self.axis    = axis
+        self.scan_no = scan_no
+        if sample_dt_ms is not None:
+            self.sample_dt_ms = float(sample_dt_ms)
+
+    def add(self, idx, enc, deg, x_mm, stage, raw, v, p_mw):
+        self.idx.append(idx);     self.enc.append(enc)
+        self.deg.append(deg);     self.x_mm.append(x_mm)
+        self.stage.append(stage); self.raw.append(raw)
+        self.v.append(v);         self.p_mw.append(p_mw)
+
+    def finalize(self):
+        if self.axis is None or not self.idx:
+            return None
+        idx = np.asarray(self.idx, dtype=int)
+        return {
+            "axis":    int(self.axis),
+            "scan_no": int(self.scan_no),
+            "idx":     idx,
+            "enc":     np.asarray(self.enc,   dtype=int),
+            "deg":     np.asarray(self.deg,   dtype=float),
+            "x_mm":    np.asarray(self.x_mm,  dtype=float),
+            "stage":   np.asarray(self.stage, dtype=int),
+            "raw":     np.asarray(self.raw,   dtype=int),
+            "v":       np.asarray(self.v,     dtype=float),
+            "p_mw":    np.asarray(self.p_mw,  dtype=float),
+            "t_ms":    self.sample_dt_ms * idx.astype(float),
+        }
+
+
+# ===========================================================================
+# Per-scan processing
+# ===========================================================================
+
+def process_scan(scan: dict, t0_info: dict, z_mm: float, run_dir: str) -> dict:
+    """
+    Process one raw scan for one axis.
+    Pipeline: moving-average -> SG smooth -> erf fit -> derivative -> T0 -> d4sigma.
+    Saves 4 plots + per-scan CSV.
+    Returns result dict.
+    """
+    axis         = scan["axis"]
+    idx_vals     = scan["idx"]
+    t_ms_vals    = scan["t_ms"]
+    enc_vals     = scan["enc"]
+    deg_vals     = scan["deg"]
+    x_mm_vals    = scan["x_mm"]
+    stage_vals   = scan["stage"]
+    raw_adc_vals = scan["raw"]
+    volt_vals    = scan["v"]
+    raw_p_vals   = scan["p_mw"]
+
+    if len(x_mm_vals) < 5:
+        print(f"  [axis {axis}]  INVALID — too few samples ({len(x_mm_vals)})")
+        return _make_invalid_result(axis, z_mm, t0_info, "too_few_samples",
+                                    0.0, 0.0, 0.0)
+
+    dt_s = (
+        1e-3 * float(np.median(np.diff(t_ms_vals)))
+        if len(t_ms_vals) >= 2
+        else RAW_SAMPLE_DT_S
+    )
+
+    # Normalise to scan start
+    x_local_mm = x_mm_vals - x_mm_vals[0]
+    deg_local  = deg_vals  - deg_vals[0]
+    enc_local  = enc_vals  - enc_vals[0]
+    deg_span   = float(np.max(deg_local) - np.min(deg_local))
+
+    # ------------------------------------------------------------------
+    # Noise filtering: moving-average (5-pt) -> Savitzky-Golay (5-pt)
+    # ------------------------------------------------------------------
+    kernel = np.ones(5) / 5.0
+    avg_p  = np.convolve(raw_p_vals, kernel, mode="same")
+    sg_p   = sg_smooth_5point(avg_p)
+
+    # ------------------------------------------------------------------
+    # Erf fit on smoothed signal
+    # ------------------------------------------------------------------
+    fit     = fit_erf_curve_simple(sg_p)
+    fit_amp = abs(fit["y_hi"] - fit["y_lo"])
+
+    fit_p, dfit = build_erf_fit_and_derivative(
+        n=len(sg_p), dt_s=dt_s,
+        x0_idx=fit["x0_idx"], w_idx=fit["w_idx"],
+        y_lo=fit["y_lo"],     y_hi=fit["y_hi"],
+    )
+
+    # ------------------------------------------------------------------
+    # T0 from peak of |derivative|
+    # ------------------------------------------------------------------
+    t0_idx  = int(np.argmax(np.abs(dfit)))
+    t0_ms   = float(t_ms_vals[t0_idx])
+    t0_deg  = float(deg_local[t0_idx])
+    t0_x_mm = float(x_local_mm[t0_idx])
+    t0_enc  = int(enc_local[t0_idx])
+
+    x_rel_mm = x_local_mm - t0_x_mm
+
+    # ------------------------------------------------------------------
+    # d4sigma beam width — second moment on |dfit| profile
+    # ------------------------------------------------------------------
+    profile_vals = np.abs(dfit)
+    p_max        = float(np.max(profile_vals))
+    profile_norm = profile_vals / p_max if p_max > 0 else profile_vals.copy()
+
+    crop_hw = min(5.0, max(2.0, 0.25 * float(np.ptp(x_rel_mm))))
+    keep    = (x_rel_mm >= -crop_hw) & (x_rel_mm <= crop_hw)
+    x_crop  = x_rel_mm[keep]
+    p_crop  = profile_norm[keep]
+
+    w_sum = float(np.sum(p_crop))
+    if w_sum > 1e-12:
+        mu_mm           = float(np.sum(x_crop * p_crop) / w_sum)
+        var_mm2         = float(np.sum(p_crop * (x_crop - mu_mm) ** 2) / w_sum)
+        sigma_mm        = float(np.sqrt(max(var_mm2, 0.0)))
+        width_4sigma_mm = 4.0 * sigma_mm
+    else:
+        mu_mm = sigma_mm = width_4sigma_mm = 0.0
+
+    # ------------------------------------------------------------------
+    # Validity gate
+    # ------------------------------------------------------------------
+    invalid_reasons = []
+    if deg_span < MIN_VALID_DEG_SPAN:
+        invalid_reasons.append(f"span={deg_span:.2f}°<{MIN_VALID_DEG_SPAN}°")
+    if fit_amp < MIN_VALID_AMP_MW:
+        invalid_reasons.append(f"amp={fit_amp:.4f}<{MIN_VALID_AMP_MW} mW")
+    if sigma_mm <= 0 or sigma_mm > MAX_VALID_SIGMA_MM:
+        invalid_reasons.append(f"sigma={sigma_mm:.4f} mm")
+
+    is_valid     = len(invalid_reasons) == 0
+    invalid_str  = "; ".join(invalid_reasons)
+    validity_tag = "" if is_valid else " [INVALID]"
+
+    # ------------------------------------------------------------------
+    # File base name:  axis0_z5p00mm
+    # ------------------------------------------------------------------
+    z_tag     = f"{z_mm:.2f}".replace(".", "p")
+    base_name = os.path.join(run_dir, f"axis{axis}_z{z_tag}mm")
+
+    # ------------------------------------------------------------------
+    # Per-scan CSV
+    # ------------------------------------------------------------------
+    header_lines = [
+        f"axis,{axis}",
+        f"z_mm,{z_mm}",
+        f"valid,{int(is_valid)}",
+        f"invalid_reason,{invalid_str}",
+        f"deg_span,{deg_span}",
+        f"samples,{len(t_ms_vals)}",
+        f"t0_idx_python,{t0_idx}",
+        f"t0_idx_stm,{t0_info.get('idx', '')}",
+        f"t0_ms_python,{t0_ms}",
+        f"t0_ms_stm,{t0_info.get('t0_ms', '')}",
+        f"t0_deg_python_local,{t0_deg}",
+        f"t0_x_mm_python_local,{t0_x_mm}",
+        f"t0_enc_python_local,{t0_enc}",
+        f"t0_enc_stm,{t0_info.get('t0_enc', '')}",
+        f"x0_counts_stm,{t0_info.get('x0_counts', '')}",
+        f"fit_x0_idx,{fit['x0_idx']}",
+        f"fit_w_idx,{fit['w_idx']}",
+        f"fit_ylo,{fit['y_lo']}",
+        f"fit_yhi,{fit['y_hi']}",
+        f"fit_amp_mw,{fit_amp}",
+        f"sigma_mm,{sigma_mm}",
+        f"width_4sigma_mm,{width_4sigma_mm}",
+        "index,time_ms,enc_local,deg_local,x_local_mm,stage,raw_adc,voltage,"
+        "raw_power_mW,sg_power_mW,erf_fit_power_mW,erf_fit_derivative,profile_norm,x_rel_mm",
+    ]
+    data = np.column_stack((
+        idx_vals, t_ms_vals, enc_local, deg_local, x_local_mm,
+        stage_vals, raw_adc_vals, volt_vals, raw_p_vals,
+        sg_p, fit_p, dfit, profile_norm, x_rel_mm,
+    ))
+    np.savetxt(base_name + ".csv", data, delimiter=",",
+               header="\n".join(header_lines), comments="")
+
+    # ------------------------------------------------------------------
+    # Invalid watermark helper
+    # ------------------------------------------------------------------
+    def _watermark(ax_obj):
+        ax_obj.text(
+            0.5, 0.5, f"INVALID\n{invalid_str}",
+            transform=ax_obj.transAxes,
+            fontsize=14, color="red", alpha=0.35,
+            ha="center", va="center", rotation=30,
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="red", alpha=0.2),
+        )
+
+    title_prefix = f"Axis {axis}  |  z = {z_mm:.2f} mm"
+
+    # ------------------------------------------------------------------
+    # Plot 1 — raw + SG + erf-fit power vs angle
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.plot(deg_local, raw_p_vals, lw=1.0,          label="Raw power (mW)")
+    ax.plot(deg_local, sg_p,       lw=1.0, ls="--", label="SG smoothed (mW)")
+    ax.plot(deg_local, fit_p,      lw=1.5,          label="Erf fit (mW)")
+    ax.axvline(t0_deg, ls=":", color="k",            label=f"T0 = {t0_deg:.3f}°")
+    ax.set_xlabel("Angle (deg)"); ax.set_ylabel("Power (mW)")
+    ax.set_title(f"{title_prefix} — Power vs Angle{validity_tag}")
+    ax.legend(fontsize=8); ax.grid(True)
+    if not is_valid:
+        _watermark(ax)
+    fig.tight_layout()
+    fig.savefig(base_name + "_power_vs_angle.png", dpi=150)
+    plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # Plot 2 — derivative vs angle
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.plot(deg_local, dfit, lw=1.5, label="d/dt erf fit")
+    ax.axvline(t0_deg, ls=":", color="k", label=f"T0 = {t0_deg:.3f}°")
+    ax.set_xlabel("Angle (deg)"); ax.set_ylabel("Derivative")
+    ax.set_title(f"{title_prefix} — Derivative vs Angle{validity_tag}")
+    ax.legend(fontsize=8); ax.grid(True)
+    if not is_valid:
+        _watermark(ax)
+    fig.tight_layout()
+    fig.savefig(base_name + "_derivative_vs_angle.png", dpi=150)
+    plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # Plot 3 — overlay (raw + erf fit + derivative)
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(deg_local, raw_p_vals, lw=1.0,          label="Raw power (mW)")
+    ax.plot(deg_local, fit_p,      lw=1.5,          label="Erf fit (mW)")
+    ax.plot(deg_local, dfit,       lw=1.5, ls="--", label="Derivative")
+    ax.axvline(t0_deg, ls=":", color="k",            label=f"T0 = {t0_deg:.3f}°")
+    ax.set_xlabel("Angle (deg)"); ax.set_ylabel("Signal")
+    ax.set_title(f"{title_prefix} — Overlay{validity_tag}")
+    ax.legend(fontsize=8); ax.grid(True)
+    if not is_valid:
+        _watermark(ax)
+    fig.tight_layout()
+    fig.savefig(base_name + "_overlay.png", dpi=150)
+    plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # Plot 4 — centred beam profile
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.plot(x_rel_mm, profile_norm, lw=1.5, label="Beam profile (normalised)")
+    ax.axvline(0.0, ls=":", color="k", label="T0")
+    title_extra = f"σ = {sigma_mm:.4f} mm  |  4σ = {width_4sigma_mm:.4f} mm"
+    ax.set_xlabel("Position relative to T0 (mm)")
+    ax.set_ylabel("Normalised profile")
+    ax.set_title(f"{title_prefix} — Beam Profile  ({title_extra}){validity_tag}")
+    ax.legend(fontsize=8); ax.grid(True)
+    if not is_valid:
+        _watermark(ax)
+    fig.tight_layout()
+    fig.savefig(base_name + "_beam_profile.png", dpi=150)
+    plt.close(fig)
+
+    validity_label = "OK" if is_valid else f"INVALID ({invalid_str})"
+    print(
+        f"  [axis {axis} | z = {z_mm:.2f} mm]  "
+        f"span = {deg_span:.1f}°  "
+        f"T0 = {t0_x_mm:.4f} mm  "
+        f"σ = {sigma_mm:.5f} mm  "
+        f"4σ = {width_4sigma_mm:.5f} mm  "
+        f"[{validity_label}]"
+    )
+
+    return {
+        "axis":                 axis,
+        "z_mm":                 z_mm,
+        "valid":                is_valid,
+        "invalid_reason":       invalid_str,
+        "deg_span":             deg_span,
+        "samples":              int(len(t_ms_vals)),
+        "t0_idx_python":        t0_idx,
+        "t0_idx_stm":           t0_info.get("idx"),
+        "t0_ms_python":         t0_ms,
+        "t0_ms_stm":            t0_info.get("t0_ms"),
+        "t0_deg_python_local":  t0_deg,
+        "t0_x_mm_python_local": t0_x_mm,
+        "t0_enc_python_local":  t0_enc,
+        "t0_enc_stm":           t0_info.get("t0_enc"),
+        "x0_counts_stm":        t0_info.get("x0_counts"),
+        "fit_x0_idx":           fit["x0_idx"],
+        "fit_w_idx":            fit["w_idx"],
+        "fit_ylo":              fit["y_lo"],
+        "fit_yhi":              fit["y_hi"],
+        "fit_amp_mw":           fit_amp,
+        "sigma_mm":             sigma_mm,
+        "width_4sigma_mm":      width_4sigma_mm,
+    }
+
+
+def _make_invalid_result(axis, z_mm, t0_info, reason,
+                         deg_span, sigma_mm, width_4sigma_mm) -> dict:
+    print(f"  [axis {axis}]  INVALID — {reason}")
+    return {
+        "axis": axis, "z_mm": z_mm,
+        "valid": False, "invalid_reason": reason,
+        "deg_span": deg_span, "samples": 0,
+        "t0_idx_python": None, "t0_idx_stm": t0_info.get("idx"),
+        "t0_ms_python":  None, "t0_ms_stm":  t0_info.get("t0_ms"),
+        "t0_deg_python_local":  None, "t0_x_mm_python_local": None,
+        "t0_enc_python_local":  None, "t0_enc_stm": t0_info.get("t0_enc"),
+        "x0_counts_stm":        t0_info.get("x0_counts"),
+        "fit_x0_idx": None, "fit_w_idx": None,
+        "fit_ylo": None, "fit_yhi": None, "fit_amp_mw": None,
+        "sigma_mm": sigma_mm, "width_4sigma_mm": width_4sigma_mm,
+    }
+
+
+# ===========================================================================
+# Parser helper
+# ===========================================================================
+
+def parse_keyvals(line: str) -> dict:
+    out = {}
+    for p in line.strip().split(",")[1:]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+# ===========================================================================
+# Summary CSV
+# ===========================================================================
+
+def save_summary_csv(results: list, run_dir: str):
+    fname = os.path.join(run_dir, "step_divergence_summary.csv")
+    fieldnames = [
+        "axis", "z_mm", "valid", "invalid_reason", "deg_span", "samples",
+        "t0_idx_python", "t0_idx_stm",
+        "t0_ms_python",  "t0_ms_stm",
+        "t0_deg_python_local", "t0_x_mm_python_local", "t0_enc_python_local",
+        "t0_enc_stm", "x0_counts_stm",
+        "fit_x0_idx", "fit_w_idx", "fit_ylo", "fit_yhi", "fit_amp_mw",
+        "sigma_mm", "width_4sigma_mm",
+    ]
+    with open(fname, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in results:
+            writer.writerow(r)
+    print(f"Saved summary CSV -> {fname}")
+
+
+# ===========================================================================
+# Main serial reader
+# ===========================================================================
+
+def run_step_divergence(ser: serial.Serial, run_dir: str) -> list:
+    """
+    Collect one scan per axis from the STM32 and process immediately on receipt.
+    Returns list of two result dicts (axis 0 and axis 1), sorted by axis.
+    """
+    print(f"Sending: {CMD.decode().strip()}")
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+    ser.write(CMD)
+
+    collector = RawScanCollector()
+
+    current_z_mm = 0.0
+    current_axis = None
+
+    # Whichever of raw scan / T0_RESULT arrives second triggers processing.
+    pending_scans = {}   # axis -> scan dict
+    pending_t0s   = {}   # axis -> t0_info dict
+    processed     = set()
+
+    results     = []
+    empty_count = 0
+    done        = False
+
+    while not done:
+        line = ser.readline().decode(errors="ignore").strip()
+
+        if not line:
+            empty_count += 1
+            if empty_count > EMPTY_LIMIT:
+                print("WARNING: serial timeout — stopping.")
+                break
+            continue
+        empty_count = 0
+        print(line)
+
+        # ------------------------------------------------------------------
+        if line.startswith("STEP_DIV_POS_BEGIN"):
+            kv           = parse_keyvals(line)
+            current_z_mm = float(kv.get("z_mm", 0.0))
+            print(f"\n>>> z = {current_z_mm:.3f} mm")
+
+        # ------------------------------------------------------------------
+        elif line.startswith("STEP_DIV_AXIS_BEGIN"):
+            kv           = parse_keyvals(line)
+            current_axis = int(kv.get("axis", 0))
+
+        # ------------------------------------------------------------------
+        elif line.startswith("RAW_SCAN_BEGIN"):
+            kv           = parse_keyvals(line)
+            stride       = float(kv.get("stride",      "1"))
+            emit_stride  = float(kv.get("emit_stride", "1"))
+            sample_dt_ms = 1000.0 * RAW_SAMPLE_DT_S * stride * emit_stride
+            axis         = int(kv.get("axis", current_axis if current_axis is not None else 0))
+            scan_no      = int(kv.get("scan", 0))
+            collector.start(axis=axis, scan_no=scan_no, sample_dt_ms=sample_dt_ms)
+
+        # ------------------------------------------------------------------
+        elif line.startswith("RAW_SCAN,"):
+            parts = line.split(",")
+            if len(parts) != 11:
+                continue
+            try:
+                collector.add(
+                    idx=int(parts[3]),   enc=int(parts[4]),
+                    deg=float(parts[5]), x_mm=float(parts[6]),
+                    stage=int(parts[7]), raw=int(parts[8]),
+                    v=float(parts[9]),   p_mw=float(parts[10]),
+                )
+            except ValueError:
+                continue
+
+        # ------------------------------------------------------------------
+        elif line.startswith("RAW_SCAN_DONE"):
+            scan = collector.finalize()
+            if scan is not None:
+                ax = scan["axis"]
+                pending_scans[ax] = scan
+                if ax in pending_t0s and ax not in processed:
+                    result = process_scan(pending_scans[ax], pending_t0s[ax],
+                                          current_z_mm, run_dir)
+                    results.append(result)
+                    processed.add(ax)
+
+        # ------------------------------------------------------------------
+        elif line.startswith("T0_RESULT"):
+            kv = parse_keyvals(line)
+            ax = int(kv.get("axis", current_axis if current_axis is not None else 0))
+            pending_t0s[ax] = {
+                "axis":      ax,
+                "idx":       int(float(kv.get("idx",       "0"))),
+                "t0_ms":     float(kv.get("t0_ms",         "0")),
+                "t0_enc":    int(float(kv.get("t0_enc",    "0"))),
+                "x0_counts": int(float(kv.get("x0_counts", "0"))),
+            }
+            if ax in pending_scans and ax not in processed:
+                result = process_scan(pending_scans[ax], pending_t0s[ax],
+                                      current_z_mm, run_dir)
+                results.append(result)
+                processed.add(ax)
+
+        # ------------------------------------------------------------------
+        elif line.startswith("STEP_DIV_AXIS_FAIL"):
+            kv = parse_keyvals(line)
+            ax = int(kv.get("axis", current_axis if current_axis is not None else 0))
+            if ax not in processed:
+                results.append(_make_invalid_result(
+                    ax, current_z_mm, pending_t0s.get(ax, {}),
+                    "stm32_axis_fail", 0.0, 0.0, 0.0
+                ))
+                processed.add(ax)
+
+        # ------------------------------------------------------------------
+        elif line.startswith("STEP_DIV_DONE"):
+            done = True
+
+    return sorted(results, key=lambda r: r["axis"])
+
+
+# ===========================================================================
+# Entry point
+# ===========================================================================
+
+def main():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir   = os.path.join(SAVE_DIR, f"stepdiv_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"Output directory: {run_dir}")
+
+    print(f"Opening {PORT} @ {BAUD}")
+    ser = serial.Serial(PORT, BAUD, timeout=SERIAL_TIMEOUT_S)
+    try:
+        results = run_step_divergence(ser, run_dir)
+    finally:
+        ser.close()
+
+    if not results:
+        print("No results collected.")
+        return
+
+    save_summary_csv(results, run_dir)
+
+    # Console summary
+    print("\n===== Summary =====")
+    for r in results:
+        tag = "OK" if r["valid"] else f"INVALID ({r['invalid_reason']})"
+        print(
+            f"  Axis {r['axis']}  |  z = {r['z_mm']:.2f} mm  |  "
+            f"σ = {r['sigma_mm']:.5f} mm  |  "
+            f"4σ = {r['width_4sigma_mm']:.5f} mm  |  "
+            f"[{tag}]"
+        )
+
+
+if __name__ == "__main__":
+    main()

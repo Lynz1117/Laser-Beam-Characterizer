@@ -1,0 +1,123 @@
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+
+PORT = "COM3"     # change if needed
+BAUD = 115200
+
+EXPECTED_POINTS = 8
+
+ser = serial.Serial(PORT, BAUD, timeout=1)
+
+angles = []
+powers_mW = []
+
+print("Waiting for one scan...")
+
+while True:
+    line = ser.readline().decode(errors="ignore").strip()
+
+    if not line:
+        continue
+
+    print(line)
+
+    if line == "SCAN_DONE":
+        break
+
+    # Expected STM32 line:
+    # ANGLE=22.5 RAW=2871 V=2.3136 P=136.7391 mW
+    if line.startswith("ANGLE="):
+        try:
+            parts = line.split()
+
+            angle_deg = float(parts[0].split("=")[1])
+            raw = int(parts[1].split("=")[1])
+            voltage = float(parts[2].split("=")[1])
+            power_mW = float(parts[3].split("=")[1])
+
+            angles.append(angle_deg)
+            powers_mW.append(power_mW)
+
+        except (IndexError, ValueError):
+            print(f"Could not parse line: {line}")
+
+ser.close()
+
+angles = np.array(angles, dtype=float)
+powers_mW = np.array(powers_mW, dtype=float)
+
+if len(powers_mW) != EXPECTED_POINTS:
+    print(f"Warning: expected {EXPECTED_POINTS} points, got {len(powers_mW)}")
+
+if len(powers_mW) == 0:
+    raise RuntimeError("No scan data received.")
+
+# Sort by angle just in case
+sort_idx = np.argsort(angles)
+angles = angles[sort_idx]
+powers_mW = powers_mW[sort_idx]
+
+# Convert to radians
+theta = np.deg2rad(angles)
+
+# -----------------------------
+# Fourier-coefficient Stokes calculation
+# Based on 8 samples at:
+# 0, 22.5, 45, 67.5, 90, 112.5, 135, 157.5 deg
+# -----------------------------
+A = 2.0 * np.sum(powers_mW) / len(powers_mW)
+B = 4.0 * np.sum(powers_mW * np.sin(2.0 * theta)) / len(powers_mW)
+C = 4.0 * np.sum(powers_mW * np.cos(4.0 * theta)) / len(powers_mW)
+D = -4.0 * np.sum(powers_mW * np.sin(4.0 * theta)) / len(powers_mW)
+
+print("\nFourier coefficients:")
+print(f"A = {A:.6f}")
+print(f"B = {B:.6f}")
+print(f"C = {C:.6f}")
+print(f"D = {D:.6f}")
+
+S0_raw = A - C
+
+if abs(S0_raw) < 1e-12:
+    raise RuntimeError("S0 is too small; cannot normalize Stokes parameters.")
+
+S0 = 1.0
+S1 = (2.0 * C) / S0_raw
+S2 = (2.0 * D) / S0_raw
+S3 = B / S0_raw
+
+S = np.array([S0, S1, S2, S3])
+
+print("\n8 Stokes intensity samples (mW):")
+for k, (ang, val) in enumerate(zip(angles, powers_mW)):
+    print(f"I{k}  angle={ang:6.1f} deg  power={val:.4f} mW")
+
+print("\nStokes Parameters:")
+print(f"S0 = {S0:.4f}")
+print(f"S1 = {S1:.4f}")
+print(f"S2 = {S2:.4f}")
+print(f"S3 = {S3:.4f}")
+print(f"S  = {S}")
+
+# Optional polarization metrics
+dolp = np.sqrt(S1**2 + S2**2)
+dop = np.sqrt(S1**2 + S2**2 + S3**2)
+
+print("\nPolarization Metrics:")
+print(f"DoLP = {dolp:.4f}")
+print(f"DoP  = {dop:.4f}")
+
+# -----------------------------
+# Plot measured points
+# -----------------------------
+plt.figure(figsize=(8, 5))
+plt.plot(angles, powers_mW, 'o-', linewidth=2, markersize=7, label="Measured Stokes Points")
+plt.xlabel("QWP Angle (deg)")
+plt.ylabel("Power (mW)")
+plt.title("8-Point Stokes Scan")
+plt.grid(True)
+plt.xticks([0, 22.5, 45, 67.5, 90, 112.5, 135, 157.5])
+plt.legend()
+plt.tight_layout()
+plt.show()

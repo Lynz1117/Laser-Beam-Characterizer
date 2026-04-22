@@ -1,0 +1,75 @@
+import serial
+import time
+
+PORT = "COM8"
+BAUD = 115200
+MOVE_TIMEOUT_S = 30
+
+ser = serial.Serial(PORT, BAUD, timeout=0.1)
+time.sleep(2)
+
+# Drain any startup messages
+deadline = time.time() + 3.0
+while time.time() < deadline:
+    raw = ser.readline()
+    if raw:
+        print(f"  STARTUP >> {raw.decode(errors='ignore').strip()}")
+
+
+def send_move_command(distance_mm: float) -> None:
+    cmd = f"S{distance_mm:.3f}\n"
+    print(f"\nSending: {cmd.strip()}")
+    ser.reset_input_buffer()
+    ser.write(cmd.encode())
+    print(f"  Wrote {len(cmd.encode())} bytes")
+
+    deadline = time.time() + MOVE_TIMEOUT_S
+    while time.time() < deadline:
+        raw = ser.readline()
+        if not raw:
+            continue
+        line = raw.decode(errors="ignore").strip()
+        print(f"  >> {line}")          # print EVERYTHING received
+        if "STEP1_DONE" in line:
+            print("Move complete.\n")
+            return
+        if "PARSE_FAIL" in line:
+            print("ERROR: STM32 rejected command.\n")
+            return
+
+    print("WARNING: timed out — STM32 sent nothing back\n")
+
+
+def prompt_distance(default_mm: float = 250.0) -> float:
+    raw = input(f"  Distance mm [{default_mm}]: ").strip()
+    if not raw:
+        return default_mm
+    try:
+        val = float(raw)
+        return val if val > 0 else default_mm
+    except ValueError:
+        return default_mm
+
+
+def main() -> None:
+    print("=== Stepper 1 Control ===")
+    print("  f = forward   b = backward   q = quit\n")
+
+    while True:
+        direction = input("Direction (f/b/q): ").strip().lower()
+        if direction == "q":
+            break
+        elif direction in ("f", "forward"):
+            send_move_command(prompt_distance())
+        elif direction in ("b", "backward"):
+            send_move_command(-prompt_distance())
+        else:
+            print("  Use f, b, or q\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        ser.close()
+        print("Port closed.")

@@ -1,0 +1,1275 @@
+import os
+from datetime import datetime
+import math
+import csv
+
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+
+PORT = "COM9"
+BAUD = 115200
+CMD  = b"DIVERGENCE\n"
+
+SAVE_DIR = "divergence_runs"
+
+ADC_FS_HZ = 20000.0
+RAW_SAMPLE_DT_S = 1.0 / ADC_FS_HZ
+SERIAL_TIMEOUT_S = 5.0
+EMPTY_LIMIT = 50000
+
+# -----------------------------------------------------------------------------
+# Bad-scan detection thresholds
+# -----------------------------------------------------------------------------
+MIN_VALID_DEG_SPAN  = 10.0
+MIN_VALID_AMP_MW    = 0.005
+MAX_VALID_SIGMA_MM  = 5.0 
+
+INVALID_SCAN_LOG = []
+
+
+def parse_keyvals(line: str):
+    out = {}
+    parts = line.strip().split(",")
+    for p in parts[1:]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def sg_smooth_5point(y):
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if n < 5:
+        return y.copy()
+
+    ys = y.copy()
+    ys[0]  = y[0]
+    ys[1]  = y[1]
+    ys[-2] = y[-2]
+    ys[-1] = y[-1]
+
+    for i in range(2, n - 2):
+        ys[i] = (
+            -3.0 * y[i - 2]
+            + 12.0 * y[i - 1]
+            + 17.0 * y[i]
+            + 12.0 * y[i + 1]
+            - 3.0 * y[i + 2]
+        ) / 35.0
+
+    return ys
+
+
+def erf_model_idx(x_idx, x0_idx, w_idx, y_lo, y_hi):
+    w_idx  = max(float(w_idx), 1e-9)
+    a      = 0.5 * (y_hi - y_lo)
+    x_idx  = np.asarray(x_idx, dtype=float)
+    z      = (x_idx - float(x0_idx)) / w_idx
+    erf_vals = np.array([math.erf(v) for v in z], dtype=float)
+    return 0.5 * (y_hi + y_lo) + a * erf_vals
+
+
+def estimate_erf_initial_params(y):
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    x = np.arange(n, dtype=float)
+
+    if n < 2:
+        return 0.0, 2.0, float(y[0]) if n else 0.0, float(y[-1]) if n else 0.0
+
+    k    = max(3, n // 10)
+    y_lo = float(np.median(y[:k]))
+    y_hi = float(np.median(y[-k:]))
+
+    y_mid  = 0.5 * (y_lo + y_hi)
+    x0_idx = float(x[np.argmin(np.abs(y - y_mid))])
+
+    dy   = np.gradient(y)
+    peak = float(np.max(np.abs(dy))) if len(dy) else 0.0
+    amp  = abs(y_hi - y_lo)
+
+    if peak > 1e-12:
+        a = 0.5 * amp
+        if a > 1e-12:
+            w_idx = max((a * (2.0 / math.sqrt(math.pi))) / peak, 2.0)
+        else:
+            w_idx = max(n / 20.0, 2.0)
+    else:
+        w_idx = max(n / 20.0, 2.0)
+
+    return x0_idx, w_idx, y_lo, y_hi
+
+
+def fit_erf_curve_simple(y, max_iters=80):
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    x = np.arange(n, dtype=float)
+
+    x0, w, y_lo, y_hi = estimate_erf_initial_params(y)
+
+    def sse(params):
+        px0, pw, py_lo, py_hi = params
+        if pw < 1e-6:
+            return 1e30
+        yf = erf_model_idx(x, px0, pw, py_lo, py_hi)
+        e  = y - yf
+        return float(np.dot(e, e))
+
+    params = [x0, w, y_lo, y_hi]
+    best   = sse(params)
+
+    step_x0 = max(8.0, n * 0.03)
+    step_w  = max(4.0, n * 0.02)
+    step_y  = max(1e-6, 0.05 * max(abs(y_hi - y_lo), 1e-6))
+
+    for _ in range(max_iters):
+        improved = False
+
+        candidates = [
+            [params[0] + step_x0, params[1],               params[2],           params[3]],
+            [params[0] - step_x0, params[1],               params[2],           params[3]],
+            [params[0],           params[1] + step_w,      params[2],           params[3]],
+            [params[0],           max(2.0, params[1] - step_w), params[2],      params[3]],
+            [params[0],           params[1],               params[2] + step_y,  params[3]],
+            [params[0],           params[1],               params[2] - step_y,  params[3]],
+            [params[0],           params[1],               params[2],           params[3] + step_y],
+            [params[0],           params[1],               params[2],           params[3] - step_y],
+        ]
+
+        for cand in candidates:
+            val = sse(cand)
+            if val < best:
+                params   = cand
+                best     = val
+                improved = True
+
+        if not improved:
+            step_x0 *= 0.5
+            step_w  *= 0.5
+            step_y  *= 0.5
+            if step_x0 < 0.05 and step_w < 0.05 and step_y < 1e-6:
+                break
+
+    return {
+        "x0_idx": float(params[0]),
+        "w_idx":  max(float(params[1]), 2.0),
+        "y_lo":   float(params[2]),
+        "y_hi":   float(params[3]),
+        "sse":    float(best),
+    }
+
+
+def build_erf_fit_and_derivative(n, dt_s, x0_idx, w_idx, y_lo, y_hi):
+    x     = np.arange(n, dtype=float)
+    w_idx = max(float(w_idx), 1e-9)
+
+    a     = 0.5 * (y_hi - y_lo)
+    z     = (x - float(x0_idx)) / w_idx
+
+    fit_y = erf_model_idx(x, x0_idx, w_idx, y_lo, y_hi)
+    fit_d = a * (2.0 / math.sqrt(math.pi)) * np.exp(-(z * z)) / (w_idx * dt_s)
+
+    return fit_y, fit_d
+
+
+# =============================================================================
+# Raw scan collector  (identical to t0 script)
+# =============================================================================
+class RawScanCollector:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.axis         = None
+        self.scan_no      = None
+        self.idx          = []
+        self.enc          = []
+        self.deg          = []
+        self.x_mm         = []
+        self.stage        = []
+        self.raw          = []
+        self.v            = []
+        self.p_mw         = []
+        self.sample_dt_ms = 1000.0 * RAW_SAMPLE_DT_S
+
+    def start(self, axis, scan_no, sample_dt_ms=None):
+        self.reset()
+        self.axis    = axis
+        self.scan_no = scan_no
+        if sample_dt_ms is not None:
+            self.sample_dt_ms = float(sample_dt_ms)
+
+    def add(self, idx, enc, deg, x_mm, stage, raw, v, p_mw):
+        self.idx.append(idx)
+        self.enc.append(enc)
+        self.deg.append(deg)
+        self.x_mm.append(x_mm)
+        self.stage.append(stage)
+        self.raw.append(raw)
+        self.v.append(v)
+        self.p_mw.append(p_mw)
+
+    def finalize(self):
+        if self.axis is None:
+            return None
+
+        idx = np.asarray(self.idx, dtype=int)
+        return {
+            "axis":    int(self.axis),
+            "scan_no": int(self.scan_no),
+            "idx":     idx,
+            "enc":     np.asarray(self.enc,   dtype=int),
+            "deg":     np.asarray(self.deg,   dtype=float),
+            "x_mm":    np.asarray(self.x_mm,  dtype=float),
+            "stage":   np.asarray(self.stage, dtype=int),
+            "raw":     np.asarray(self.raw,   dtype=int),
+            "v":       np.asarray(self.v,     dtype=float),
+            "p_mw":    np.asarray(self.p_mw,  dtype=float),
+            "t_ms":    self.sample_dt_ms * np.arange(len(idx), dtype=float),
+        }
+
+
+# =============================================================================
+# Per-scan processing  (aligned with t0 script, adds z_mm / step_no)
+# =============================================================================
+def process_one_scan(scan0, t0_info, z_mm, step_no, run_dir):
+    idx_vals     = np.array(scan0["idx"],   dtype=int)
+    t_ms_vals    = np.array(scan0["t_ms"],  dtype=float)
+    enc_vals     = np.array(scan0["enc"],   dtype=int)
+    deg_vals     = np.array(scan0["deg"],   dtype=float)
+    x_mm_vals    = np.array(scan0["x_mm"], dtype=float)
+    stage_vals   = np.array(scan0["stage"], dtype=int)
+    raw_adc_vals = np.array(scan0["raw"],   dtype=int)
+    volt_vals    = np.array(scan0["v"],     dtype=float)
+    raw_p_vals   = np.array(scan0["p_mw"], dtype=float)
+
+    if len(x_mm_vals) < 2:
+        raise RuntimeError("Not enough position samples in scan.")
+
+    dt_s = (
+        1e-3 * float(np.median(np.diff(t_ms_vals)))
+        if len(t_ms_vals) >= 2
+        else RAW_SAMPLE_DT_S
+    )
+
+    x_local_mm = x_mm_vals - x_mm_vals[0]
+    deg_local  = deg_vals  - deg_vals[0]
+    enc_local  = enc_vals  - enc_vals[0]
+
+    deg_span = float(np.max(deg_local) - np.min(deg_local))
+
+    kernel     = np.ones(5) / 5
+    avg_p_vals = np.convolve(raw_p_vals, kernel, mode="same")
+    sg_p_vals  = sg_smooth_5point(avg_p_vals)
+
+    fit     = fit_erf_curve_simple(sg_p_vals)
+    fit_amp = abs(fit["y_hi"] - fit["y_lo"])
+
+    fit_p_vals, dfit_vals = build_erf_fit_and_derivative(
+        n=len(sg_p_vals),
+        dt_s=dt_s,
+        x0_idx=fit["x0_idx"],
+        w_idx=fit["w_idx"],
+        y_lo=fit["y_lo"],
+        y_hi=fit["y_hi"],
+    )
+
+    t0_idx  = int(np.argmax(np.abs(dfit_vals)))
+    t0_ms   = float(t_ms_vals[t0_idx])
+    t0_deg  = float(deg_local[t0_idx])
+    t0_x_mm = float(x_local_mm[t0_idx])
+    t0_enc  = int(enc_local[t0_idx])
+
+    x_rel_mm = x_local_mm - t0_x_mm
+
+    profile_vals = np.abs(dfit_vals)
+    profile_norm = (
+        profile_vals / np.max(profile_vals)
+        if np.max(profile_vals) > 0
+        else profile_vals.copy()
+    )
+
+    x_span          = np.max(x_rel_mm) - np.min(x_rel_mm)
+    crop_half_width = max(2.0, 0.40 * x_span)
+    keep   = (x_rel_mm >= -crop_half_width) & (x_rel_mm <= crop_half_width)
+    x_crop = x_rel_mm[keep]
+    p_crop = profile_norm[keep]
+
+    w_sum = np.sum(p_crop)
+    if w_sum > 0:
+        mu_mm           = float(np.sum(x_crop * p_crop) / w_sum)
+        var_mm2         = float(np.sum(p_crop * (x_crop - mu_mm) ** 2) / w_sum)
+        sigma_mm        = float(np.sqrt(max(var_mm2, 0.0)))
+        width_4sigma_mm = float(4.0 * sigma_mm)
+    else:
+        mu_mm = sigma_mm = width_4sigma_mm = 0.0
+
+    is_valid = (
+        deg_span >= MIN_VALID_DEG_SPAN
+        and fit_amp >= MIN_VALID_AMP_MW
+        and 0 < sigma_mm <= MAX_VALID_SIGMA_MM
+    )
+    
+    scan_no = int(scan0["scan_no"])
+    axis    = int(scan0["axis"])
+
+    invalid_reasons = []
+
+    EDGE_MARGIN_DEG = 10.0
+    deg_min = float(np.min(deg_local))
+    deg_max = float(np.max(deg_local))
+
+    # 1) minimum scan span
+    if deg_span < MIN_VALID_DEG_SPAN:
+        invalid_reasons.append(f"span={deg_span:.2f}°<{MIN_VALID_DEG_SPAN}°")
+
+    # 2) minimum fitted amplitude
+    if fit_amp < MIN_VALID_AMP_MW:
+        invalid_reasons.append(f"amp={fit_amp:.4f}<{MIN_VALID_AMP_MW}mW")
+
+    # 3) sigma bounds
+    if sigma_mm <= 0 or sigma_mm > MAX_VALID_SIGMA_MM:
+        invalid_reasons.append(f"sigma={sigma_mm:.4f}mm")
+
+    # 4) t0 must not be too close to either edge of the scan window
+    if (t0_deg - deg_min) <= EDGE_MARGIN_DEG or (deg_max - t0_deg) <= EDGE_MARGIN_DEG:
+        invalid_reasons.append(
+            f"t0 too close to edge: t0={t0_deg:.2f}°, "
+            f"window=[{deg_min:.2f}°, {deg_max:.2f}°], "
+            f"margin={EDGE_MARGIN_DEG:.2f}°"
+        )
+
+    # final truth: valid only if NO invalid reasons
+    is_valid = (len(invalid_reasons) == 0)
+    invalid_str = "; ".join(invalid_reasons)
+
+    if not is_valid:
+        INVALID_SCAN_LOG.append({
+            "z_mm": z_mm,
+            "step_no": step_no,
+            "axis": axis,
+            "scan_no": scan_no,
+            "t0_deg": t0_deg,
+            "t0_idx": t0_idx,
+            "deg_min": deg_min,
+            "deg_max": deg_max,
+            "deg_span": deg_span,
+            "sigma_mm": sigma_mm,
+            "fit_amp_mw": fit_amp,
+            "reason": invalid_str,
+        })
+
+    base_name = os.path.join(
+        run_dir,
+        f"z_{z_mm:07.3f}_step_{step_no:02d}_axis{axis}_scan_{scan_no:02d}"
+    )
+
+    validity_tag = "" if is_valid else " [INVALID]"
+
+    # -------------------------------------------------------------------------
+    # CSV
+    # -------------------------------------------------------------------------
+    header_lines = [
+        f"z_mm,{z_mm}",
+        f"step_no,{step_no}",
+        f"scan,{scan_no}",
+        f"axis,{axis}",
+        f"valid,{int(is_valid)}",
+        f"invalid_reason,{invalid_str}",
+        f"deg_span,{deg_span}",
+        f"samples,{len(t_ms_vals)}",
+        f"t0_idx_python,{t0_idx}",
+        f"t0_idx_stm,{t0_info.get('idx')}",
+        f"t0_ms_python,{t0_ms}",
+        f"t0_ms_stm,{t0_info.get('t0_ms')}",
+        f"t0_deg_python_local,{t0_deg}",
+        f"t0_x_mm_python_local,{t0_x_mm}",
+        f"t0_enc_python_local,{t0_enc}",
+        f"t0_enc_stm,{t0_info.get('t0_enc')}",
+        f"x0_counts_stm,{t0_info.get('x0_counts')}",
+        f"fit_x0_idx,{fit['x0_idx']}",
+        f"fit_w_idx,{fit['w_idx']}",
+        f"fit_ylo,{fit['y_lo']}",
+        f"fit_yhi,{fit['y_hi']}",
+        f"fit_amp_mw,{fit_amp}",
+        f"sigma_mm,{sigma_mm}",
+        f"width_4sigma_mm,{width_4sigma_mm}",
+        "index,time_ms,enc_local,deg_local,x_local_mm,stage,raw_adc,voltage,"
+        "raw_power_mW,sg_power_mW,erf_fit_power_mW,erf_fit_derivative,profile_norm,x_rel_mm",
+    ]
+    header_text = "\n".join(header_lines)
+
+    data = np.column_stack((
+        idx_vals, t_ms_vals, enc_local, deg_local, x_local_mm,
+        stage_vals, raw_adc_vals, volt_vals, raw_p_vals,
+        sg_p_vals, fit_p_vals, dfit_vals, profile_norm, x_rel_mm,
+    ))
+
+    csv_file = base_name + ".csv"
+    np.savetxt(csv_file, data, delimiter=",", header=header_text, comments="")
+    print(f"Saved CSV -> {csv_file}")
+    
+    # -------------------------------------------------------------------------
+    # Shared watermark helper
+    # -------------------------------------------------------------------------
+    def add_invalid_watermark(ax):
+        if is_valid:
+            return
+        ax.text(
+            0.5, 0.5, "INVALID\n" + invalid_str,
+            transform=ax.transAxes,
+            fontsize=16, color="red", alpha=0.35,
+            ha="center", va="center", rotation=30,
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="red", alpha=0.2),
+        )
+
+    # -------------------------------------------------------------------------
+    # Plot 1: Power vs Angle
+    # -------------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(11, 6))
+    ax.plot(deg_local, raw_p_vals, label="Raw power (mW)")
+    ax.plot(deg_local, fit_p_vals, label="Erf fit power (mW)")
+    ax.axvline(t0_deg, linestyle="--", label=f"T0 = {t0_deg:.4f} deg")
+    ax.set_ylabel("Power (mW)")
+    ax.set_xlabel("Angle (deg)")
+    ax.set_title(f"Z={z_mm:.3f} mm  Step {step_no}  Axis {axis}: Power vs Angle{validity_tag}")
+    ax.grid(True)
+    ax.legend()
+    add_invalid_watermark(ax)
+    fig.savefig(base_name + "_power_vs_degree.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # -------------------------------------------------------------------------
+    # Plot 2: Derivative vs Degree
+    # -------------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(11, 6))
+    ax.plot(deg_local, dfit_vals, label="d/dt of erf fit")
+    ax.axvline(t0_deg, linestyle="--", label=f"T0 = {t0_deg:.4f} deg")
+    ax.set_xlabel("Angle (deg)")
+    ax.set_ylabel("Derivative")
+    ax.set_title(f"Z={z_mm:.3f} mm  Step {step_no}  Axis {axis}: Derivative vs Degree{validity_tag}")
+    ax.grid(True)
+    ax.legend()
+    add_invalid_watermark(ax)
+    fig.savefig(base_name + "_derivative_vs_degree.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # -------------------------------------------------------------------------
+    # Plot 3: T0 Overlay
+    # -------------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(12, 7))
+    ax.plot(deg_local, raw_p_vals, label="Raw power (mW)")
+    ax.plot(deg_local, fit_p_vals, label="Erf fit power (mW)")
+    ax.plot(deg_local, dfit_vals,  label="Derivative of erf fit")
+    ax.axvline(t0_deg, linestyle="--", label=f"T0 = {t0_deg:.4f} deg")
+    ax.set_xlabel("Angle (deg)")
+    ax.set_ylabel("Signal")
+    ax.set_title(f"Z={z_mm:.3f} mm  Step {step_no}  Axis {axis}: T0 Overlay{validity_tag}")
+    ax.grid(True)
+    ax.legend()
+    add_invalid_watermark(ax)
+    fig.savefig(base_name + "_overlay_vs_angle.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # -------------------------------------------------------------------------
+    # Plot 4: Beam Profile
+    # -------------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(11, 6))
+    ax.plot(x_rel_mm, profile_norm, label="Beam profile (normalized)")
+    ax.axvline(0.0, linestyle="--", label="T0")
+    ax.set_xlabel("Position relative to T0 (mm)")
+    ax.set_ylabel("Normalized profile")
+    ax.set_title(
+        f"Z={z_mm:.3f} mm  Step {step_no}  Axis {axis}: Beam Profile "
+        f"(σ={sigma_mm:.4f} mm, 4σ={width_4sigma_mm:.4f} mm){validity_tag}"
+    )
+    ax.grid(True)
+    ax.legend()
+    add_invalid_watermark(ax)
+    fig.savefig(base_name + "_beam_profile.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    stm_t0_ms  = t0_info.get("t0_ms")
+    stm_t0_enc = t0_info.get("t0_enc")
+
+    print(
+        f"Z={z_mm:7.3f} mm  step={step_no:02d} axis={axis}  "
+        f"T0_py={t0_x_mm:.4f} mm  "
+        f"T0_stm_ms={stm_t0_ms}  "
+        f"T0_stm_enc={stm_t0_enc}  "
+        f"sigma={sigma_mm:.6f} mm  4sigma={width_4sigma_mm:.6f} mm  "
+        f"[{'OK' if is_valid else 'INVALID'}]"
+    )
+
+    return {
+        "z_mm":                 z_mm,
+        "step_no":              step_no,
+        "scan_no":              scan_no,
+        "axis":                 axis,
+        "valid":                is_valid,
+        "invalid_reason":       invalid_str,
+        "deg_span":             deg_span,
+        "samples":              len(t_ms_vals),
+        "t0_idx_python":        t0_idx,
+        "t0_idx_stm":           t0_info.get("idx"),
+        "t0_ms_python":         t0_ms,
+        "t0_ms_stm":            stm_t0_ms,
+        "t0_deg_python_local":  t0_deg,
+        "t0_x_mm_python_local": t0_x_mm,
+        "t0_enc_python_local":  t0_enc,
+        "t0_enc_stm":           stm_t0_enc,
+        "x0_counts_stm":        t0_info.get("x0_counts"),
+        "fit_x0_idx":           fit["x0_idx"],
+        "fit_w_idx":            fit["w_idx"],
+        "fit_ylo":              fit["y_lo"],
+        "fit_yhi":              fit["y_hi"],
+        "fit_amp_mw":           fit_amp,
+        "sigma_mm":             sigma_mm,
+        "width_4sigma_mm":      width_4sigma_mm,
+    }
+
+
+# =============================================================================
+# Summary CSV
+# =============================================================================
+def save_divergence_summary(results, run_dir):
+    summary_csv = os.path.join(run_dir, "divergence_summary.csv")
+    with open(summary_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "z_mm", "step_no", "scan_no", "axis", "valid", "invalid_reason",
+            "deg_span", "samples",
+            "t0_idx_python", "t0_idx_stm",
+            "t0_ms_python", "t0_ms_stm",
+            "t0_deg_python_local", "t0_x_mm_python_local", "t0_enc_python_local",
+            "t0_enc_stm", "x0_counts_stm",
+            "fit_x0_idx", "fit_w_idx", "fit_ylo", "fit_yhi", "fit_amp_mw",
+            "sigma_mm", "width_4sigma_mm",
+            "n_valid_scans", "n_total_scans",
+        ])
+        for r in results:
+            writer.writerow([
+                r["z_mm"], r["step_no"], r["scan_no"], r["axis"], int(r["valid"]),
+                r["invalid_reason"], r["deg_span"], r["samples"],
+                r["t0_idx_python"], r["t0_idx_stm"],
+                r["t0_ms_python"], r["t0_ms_stm"],
+                r["t0_deg_python_local"], r["t0_x_mm_python_local"],
+                r["t0_enc_python_local"], r["t0_enc_stm"], r["x0_counts_stm"],
+                r["fit_x0_idx"], r["fit_w_idx"], r["fit_ylo"], r["fit_yhi"],
+                r["fit_amp_mw"], r["sigma_mm"], r["width_4sigma_mm"],
+                r.get("n_valid_scans", 0), r.get("n_total_scans", 0),
+            ])
+    print(f"Saved summary -> {summary_csv}")
+    
+def save_invalid_scan_log(run_dir):
+    if not INVALID_SCAN_LOG:
+        print("No invalid scans logged.")
+        return
+
+    path = os.path.join(run_dir, "invalid_scans_log.csv")
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=INVALID_SCAN_LOG[0].keys())
+        writer.writeheader()
+        writer.writerows(INVALID_SCAN_LOG)
+
+    print(f"Saved invalid scan log -> {path}")
+
+
+# =============================================================================
+# Plot: beam width vs Z
+# =============================================================================
+def plot_width_vs_z(results, run_dir):
+    axes = sorted(set(r["axis"] for r in results))
+    for ax in axes:
+        valid_ax = sorted(
+            [r for r in results if r["axis"] == ax and r["valid"]],
+            key=lambda r: r["z_mm"]
+        )
+        if not valid_ax:
+            continue
+
+        z     = np.array([r["z_mm"]           for r in valid_ax], dtype=float)
+        sigma = np.array([r["sigma_mm"]        for r in valid_ax], dtype=float)
+        width = np.array([r["width_4sigma_mm"] for r in valid_ax], dtype=float)
+
+        fig, axp = plt.subplots(figsize=(10, 6))
+        axp.plot(z, sigma, marker="o", label="Sigma (mm)")
+        axp.plot(z, width, marker="s", label="4σ width (mm)")
+        axp.set_xlabel("Z position (mm)")
+        axp.set_ylabel("Beam width (mm)")
+        axp.set_title(f"Axis {ax}: Beam Width vs Z")
+        axp.grid(True)
+        axp.legend()
+        fig.savefig(
+            os.path.join(run_dir, f"axis_{ax}_width_vs_z.png"),
+            dpi=300, bbox_inches="tight"
+        )
+        plt.close(fig)
+        print(f"Saved width vs Z -> axis_{ax}_width_vs_z.png")
+
+
+# =============================================================================
+# Plot: hourglass / beam waist profile
+# =============================================================================
+def plot_beam_profile_hourglass(results, run_dir):
+
+    def beam_hyperbola(z, w0, z0, zR):
+        return w0 * np.sqrt(1.0 + ((z - z0) / zR) ** 2)
+
+    axes = sorted(set(r["axis"] for r in results))
+    for ax in axes:
+        valid_ax = sorted(
+            [r for r in results if r["axis"] == ax and r["valid"]],
+            key=lambda r: r["z_mm"]
+        )
+        if len(valid_ax) < 2:
+            continue
+
+        z = np.array([r["z_mm"]    for r in valid_ax], dtype=float)
+        w = np.array([r["sigma_mm"] for r in valid_ax], dtype=float)
+        
+        if np.ptp(z) <= 1e-9:
+            print(f"Axis {ax}: Z positions not changing -> skipping hourglass fit")
+            continue
+
+        try:
+            p0 = [np.min(w), z[np.argmin(w)], (np.max(z) - np.min(z)) / 2]
+            popt, _ = curve_fit(beam_hyperbola, z, w, p0=p0, maxfev=10000)
+            w0_fit, z0_fit, zR_fit = popt
+            z_fine = np.linspace(np.min(z), np.max(z), 500)
+            w_fine = beam_hyperbola(z_fine, *popt)
+            fit_ok = True
+        except Exception:
+            fit_ok  = False
+            z_fine  = np.linspace(np.min(z), np.max(z), 500)
+            w_fine  = np.interp(z_fine, z, w)
+            w0_fit  = z0_fit = zR_fit = None
+
+        fig, axis_plot = plt.subplots(figsize=(13, 6))
+
+        axis_plot.fill_between(z_fine,  w_fine, -w_fine, alpha=0.18, color="steelblue")
+        axis_plot.plot(z_fine,  w_fine, color="steelblue", linewidth=2, label="Beam envelope (fit)")
+        axis_plot.plot(z_fine, -w_fine, color="steelblue", linewidth=2)
+
+        axis_plot.scatter(z,  w, color="navy", zorder=5, s=50, label="Measured σ")
+        axis_plot.scatter(z, -w, color="navy", zorder=5, s=50)
+
+        for zi, wi in zip(z, w):
+            axis_plot.plot([zi, zi], [-wi * 1.05, wi * 1.05],
+                           color="gray", linewidth=1.2, linestyle="-", alpha=0.5)
+
+        axis_plot.axhline(0, color="black", linewidth=0.8, linestyle="-")
+
+        if fit_ok and np.min(z) < z0_fit < np.max(z):
+            axis_plot.axvline(z0_fit, color="red", linewidth=1.5,
+                              linestyle="--",
+                              label=f"Waist z={z0_fit:.1f} mm")
+            offset_x = (np.max(z) - np.min(z)) * 0.04
+            axis_plot.annotate(
+                f"w₀ = {w0_fit:.3f} mm\nzᴿ = {abs(zR_fit):.1f} mm",
+                xy=(z0_fit, w0_fit),
+                xytext=(z0_fit + offset_x, w0_fit * 1.6),
+                fontsize=9,
+                arrowprops=dict(arrowstyle="->", color="red"),
+                color="red"
+            )
+        elif fit_ok:
+            axis_plot.text(
+                0.02, 0.97,
+                f"w₀={w0_fit:.3f} mm  z₀={z0_fit:.1f} mm  zᴿ={abs(zR_fit):.1f} mm",
+                transform=axis_plot.transAxes,
+                fontsize=8, va="top", color="red"
+            )
+
+        axis_plot.set_xlabel("Z position (mm)")
+        axis_plot.set_ylabel("Beam half-width σ (mm)")
+        axis_plot.set_title(f"Axis {ax}: Beam Profile — Hourglass View")
+        axis_plot.legend()
+        axis_plot.grid(True, alpha=0.3)
+
+        if not np.all(np.isfinite(w_fine)):
+            print(f"Axis {ax}: non-finite fit values -> skipping hourglass plot")
+            plt.close(fig)
+            continue
+
+        ylim = np.max(np.abs(w_fine)) * 1.5
+        if not np.isfinite(ylim) or ylim <= 0:
+            print(f"Axis {ax}: invalid ylim -> skipping hourglass plot")
+            plt.close(fig)
+            continue
+
+        axis_plot.set_ylim(-ylim, ylim)
+
+        out = os.path.join(run_dir, f"axis_{ax}_hourglass.png")
+        fig.savefig(out, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved hourglass -> {out}")
+
+
+# =============================================================================
+# Plot: 3D beam envelope
+# =============================================================================
+def plot_beam_3d(results, run_dir):
+
+    def beam_hyperbola(z, w0, z0, zR):
+        return w0 * np.sqrt(1.0 + ((z - z0) / zR) ** 2)
+
+    def fit_axis(z_data, w_data, z_fine):
+        try:
+            p0 = [np.min(w_data), z_data[np.argmin(w_data)],
+                  (np.max(z_data) - np.min(z_data)) / 2]
+            popt, _ = curve_fit(beam_hyperbola, z_data, w_data, p0=p0, maxfev=10000)
+            return beam_hyperbola(z_fine, *popt), popt
+        except Exception:
+            return np.interp(z_fine, z_data, w_data), None
+
+    axis0 = sorted([r for r in results if r["axis"] == 0 and r["valid"]], key=lambda r: r["z_mm"])
+    axis1 = sorted([r for r in results if r["axis"] == 1 and r["valid"]], key=lambda r: r["z_mm"])
+
+    if len(axis0) < 2 or len(axis1) < 2:
+        print("Not enough valid data on both axes for 3D plot — skipping")
+        return
+
+    z0_vals = np.array([r["z_mm"]    for r in axis0])
+    z1_vals = np.array([r["z_mm"]    for r in axis1])
+    w0_vals = np.array([r["sigma_mm"] for r in axis0])
+    w1_vals = np.array([r["sigma_mm"] for r in axis1])
+
+    z_min  = max(np.min(z0_vals), np.min(z1_vals))
+    z_max  = min(np.max(z0_vals), np.max(z1_vals))
+    z_fine = np.linspace(z_min, z_max, 200)
+
+    wx_fine, popt_x = fit_axis(z0_vals, w0_vals, z_fine)
+    wy_fine, popt_y = fit_axis(z1_vals, w1_vals, z_fine)
+
+    theta  = np.linspace(0, 2 * np.pi, 120)
+    Z_surf = np.zeros((len(z_fine), len(theta)))
+    X_surf = np.zeros_like(Z_surf)
+    Y_surf = np.zeros_like(Z_surf)
+
+    for i, (zi, wxi, wyi) in enumerate(zip(z_fine, wx_fine, wy_fine)):
+        Z_surf[i, :] = zi
+        X_surf[i, :] = wxi * np.cos(theta)
+        Y_surf[i, :] = wyi * np.sin(theta)
+
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    fig   = plt.figure(figsize=(14, 8))
+    ax3d  = fig.add_subplot(111, projection="3d")
+
+    ax3d.plot_surface(Z_surf, X_surf, Y_surf,
+                      alpha=0.3, color="steelblue",
+                      rstride=4, cstride=4,
+                      edgecolor="steelblue", linewidth=0.15)
+    ax3d.plot(z_fine, np.zeros_like(z_fine), np.zeros_like(z_fine),
+              color="navy", linewidth=1.5, linestyle="--", label="Beam axis")
+
+    for r in axis0:
+        th        = np.linspace(0, 2 * np.pi, 80)
+        wx        = r["sigma_mm"]
+        wy_interp = float(np.interp(r["z_mm"], z1_vals, w1_vals))
+        ax3d.plot(np.full_like(th, r["z_mm"]),
+                  wx * np.cos(th), wy_interp * np.sin(th),
+                  color="red", linewidth=1.0, alpha=0.6)
+
+    if popt_x is not None:
+        w0x, z0x, _ = popt_x
+        ax3d.scatter([z0x], [0], [0], color="red", s=60, zorder=10,
+                     label=f"X waist z={z0x:.1f} mm  w={w0x:.3f} mm")
+    if popt_y is not None:
+        w0y, z0y, _ = popt_y
+        ax3d.scatter([z0y], [0], [0], color="orange", s=60, zorder=10,
+                     label=f"Y waist z={z0y:.1f} mm  w={w0y:.3f} mm")
+
+    ax3d.set_xlabel("Z (mm)")
+    ax3d.set_ylabel("X width (mm)")
+    ax3d.set_zlabel("Y width (mm)")
+    ax3d.set_title("3D Beam Envelope")
+    ax3d.legend(fontsize=8)
+
+    png_path = os.path.join(run_dir, "beam_3d_envelope.png")
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved 3D PNG -> {png_path}")
+
+    try:
+        import plotly.graph_objects as go
+
+        surface = go.Surface(x=Z_surf, y=X_surf, z=Y_surf,
+                             opacity=0.35, colorscale="Blues",
+                             showscale=False, name="Beam envelope")
+        spine   = go.Scatter3d(x=z_fine, y=np.zeros_like(z_fine), z=np.zeros_like(z_fine),
+                               mode="lines",
+                               line=dict(color="navy", width=3, dash="dash"),
+                               name="Beam axis")
+
+        ring_traces = []
+        for r in axis0:
+            th        = np.linspace(0, 2 * np.pi, 80)
+            wx        = r["sigma_mm"]
+            wy_interp = float(np.interp(r["z_mm"], z1_vals, w1_vals))
+            ring_traces.append(go.Scatter3d(
+                x=np.full(len(th), r["z_mm"]),
+                y=wx * np.cos(th), z=wy_interp * np.sin(th),
+                mode="lines", line=dict(color="red", width=2),
+                name=f"Z={r['z_mm']:.0f} mm", showlegend=False
+            ))
+
+        waist_markers = []
+        if popt_x is not None:
+            w0x, z0x, _ = popt_x
+            waist_markers.append(go.Scatter3d(
+                x=[z0x], y=[0], z=[0], mode="markers+text",
+                marker=dict(color="red", size=6),
+                text=[f"X waist<br>w={w0x:.3f} mm"],
+                textposition="top center",
+                name=f"X waist z={z0x:.1f} mm"
+            ))
+        if popt_y is not None:
+            w0y, z0y, _ = popt_y
+            waist_markers.append(go.Scatter3d(
+                x=[z0y], y=[0], z=[0], mode="markers+text",
+                marker=dict(color="orange", size=6),
+                text=[f"Y waist<br>w={w0y:.3f} mm"],
+                textposition="top center",
+                name=f"Y waist z={z0y:.1f} mm"
+            ))
+
+        fig_plotly = go.Figure(data=[surface, spine] + ring_traces + waist_markers)
+        fig_plotly.update_layout(
+            title="3D Beam Envelope (interactive — rotate / zoom freely)",
+            scene=dict(xaxis_title="Z (mm)", yaxis_title="X width (mm)",
+                       zaxis_title="Y width (mm)", aspectmode="data"),
+            width=1100, height=750,
+            legend=dict(x=0.01, y=0.99)
+        )
+
+        html_path = os.path.join(run_dir, "beam_3d_envelope.html")
+        fig_plotly.write_html(html_path)
+        print(f"Saved interactive 3D -> {html_path}")
+
+    except ImportError:
+        print("plotly not installed — skipping interactive 3D HTML")
+        print("Install with:  pip install plotly")
+
+
+# =============================================================================
+# Divergence fit and plot
+# =============================================================================
+def calculate_divergence(results, run_dir):
+
+    def beam_hyperbola(z, w0, z0, zR):
+        return w0 * np.sqrt(1.0 + ((z - z0) / zR) ** 2)
+
+    summary_lines = []
+    axes = sorted(set(r["axis"] for r in results))
+
+    for ax in axes:
+        valid_ax = sorted(
+            [r for r in results if r["axis"] == ax and r["valid"]],
+            key=lambda r: r["z_mm"]
+        )
+        if len(valid_ax) < 3:
+            print(f"Axis {ax}: not enough points for divergence fit")
+            continue
+
+        z = np.array([r["z_mm"]    for r in valid_ax], dtype=float)
+        w = np.array([r["sigma_mm"] for r in valid_ax], dtype=float)
+        
+        if np.ptp(z) <= 1e-9:
+            print(f"Axis {ax}: Z positions not changing -> skipping divergence fit")
+            continue
+
+        try:
+            p0 = [np.min(w), z[np.argmin(w)], (np.max(z) - np.min(z)) / 2]
+            popt, pcov = curve_fit(beam_hyperbola, z, w, p0=p0, maxfev=10000)
+            w0_mm, z0_mm, zR_mm = popt
+            perr = np.sqrt(np.diag(pcov))
+
+            theta_div_rad   = abs(w0_mm / zR_mm)
+            theta_div_mrad  = theta_div_rad * 1000.0
+            theta_full_mrad = 2.0 * theta_div_mrad
+
+            line = (
+                f"Axis {ax}:\n"
+                f"  w0     = {w0_mm:.4f} mm  ({w0_mm*1000:.2f} µm)\n"
+                f"  z0     = {z0_mm:.2f} mm\n"
+                f"  zR     = {abs(zR_mm):.2f} mm\n"
+                f"  θ_div  = {theta_div_mrad:.4f} mrad  (half-angle)\n"
+                f"  2θ_div = {theta_full_mrad:.4f} mrad  (full angle)\n"
+                f"  Fit σ: w0±{perr[0]:.4f}  z0±{perr[1]:.2f}  zR±{perr[2]:.2f}\n"
+            )
+            summary_lines.append(line)
+            print(line)
+
+            fig, axp = plt.subplots(figsize=(12, 6))
+
+            z_ext = np.linspace(z0_mm - abs(zR_mm) * 3,
+                                z0_mm + abs(zR_mm) * 3, 500)
+            w_ext = beam_hyperbola(z_ext, *popt)
+
+            axp.plot(z_ext, w_ext, color="steelblue", linewidth=2,
+                     label="Gaussian beam fit")
+            axp.scatter(z, w, color="navy", zorder=5, s=60,
+                        label="Measured σ")
+
+            z_fwd = np.array([z0_mm, z0_mm + abs(zR_mm) * 3])
+            z_bwd = np.array([z0_mm - abs(zR_mm) * 3, z0_mm])
+            axp.plot(z_fwd,  theta_div_rad * (z_fwd - z0_mm),
+                     "r--", linewidth=1.2,
+                     label=f"θ_div = {theta_div_mrad:.3f} mrad")
+            axp.plot(z_fwd, -theta_div_rad * (z_fwd - z0_mm), "r--", linewidth=1.2)
+            axp.plot(z_bwd,  theta_div_rad * (z0_mm - z_bwd), "r--", linewidth=1.2)
+            axp.plot(z_bwd, -theta_div_rad * (z0_mm - z_bwd), "r--", linewidth=1.2)
+
+            axp.axvline(z0_mm + abs(zR_mm), color="green",
+                        linestyle=":", linewidth=1.2, alpha=0.7,
+                        label=f"±zR = {abs(zR_mm):.1f} mm")
+            axp.axvline(z0_mm - abs(zR_mm), color="green",
+                        linestyle=":", linewidth=1.2, alpha=0.7)
+            axp.axvline(z0_mm, color="gray",
+                        linestyle="--", linewidth=1.0, alpha=0.5,
+                        label=f"Waist z={z0_mm:.1f} mm")
+
+            axp.annotate(
+                f"w₀ = {w0_mm*1000:.2f} µm\nθ = {theta_div_mrad:.3f} mrad",
+                xy=(z0_mm, w0_mm),
+                xytext=(z0_mm + abs(zR_mm) * 0.5, w0_mm * 2.5),
+                fontsize=10,
+                arrowprops=dict(arrowstyle="->", color="black"),
+            )
+
+            axp.set_xlabel("Z position (mm)")
+            axp.set_ylabel("Beam half-width σ (mm)")
+            axp.set_title(
+                f"Axis {ax}: Divergence — "
+                f"θ_div = {theta_div_mrad:.3f} mrad  "
+                f"w₀ = {w0_mm*1000:.2f} µm"
+            )
+            axp.grid(True, alpha=0.3)
+            axp.legend()
+
+            out = os.path.join(run_dir, f"axis_{ax}_divergence.png")
+            fig.savefig(out, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Saved divergence plot -> {out}")
+
+        except Exception as e:
+            print(f"Axis {ax}: divergence fit failed — {e}")
+            summary_lines.append(f"Axis {ax}: fit failed — {e}\n")
+
+    txt_path = os.path.join(run_dir, "divergence_results.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(summary_lines))
+    print(f"Saved divergence results -> {txt_path}")
+
+
+# =============================================================================
+# Serial receive loop  (aligned with t0 script)
+# =============================================================================
+def run_divergence_batch(ser, run_dir):
+    print(f"Sending command: {CMD.decode().strip()}")
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+    ser.write(CMD)
+
+    collector = RawScanCollector()
+
+    # Keys are (axis, scan_no) — same pattern as t0 script.
+    # z_mm / step_no context is tracked separately and written into the result
+    # record when a scan is processed.
+    raw_scans  = {}   # (axis, scan_no) -> scan dict
+    t0_results = {}   # (axis, scan_no) -> t0 info dict
+    processed  = set()
+    results    = []
+
+    current_z_mm    = 0.0
+    current_step_no = 0
+    current_axis    = 0
+    
+    stm_invalid_scans = set()
+
+    # Per-(axis,scan_no) z/step context recorded at RAW_SCAN_BEGIN time so it
+    # is available when the scan is processed later.
+    scan_context = {}   # (axis, scan_no) -> {"z_mm": ..., "step_no": ...}
+
+    empty_count = 0
+    batch_done  = False
+
+    while not batch_done:
+        line = ser.readline().decode(errors="ignore").strip()
+
+        if not line:
+            empty_count += 1
+            if empty_count > EMPTY_LIMIT:
+                raise RuntimeError("Timed out waiting for divergence data.")
+            continue
+
+        empty_count = 0
+        print(line)
+
+        if line.startswith("DIV_POS_BEGIN"):
+            kv = parse_keyvals(line)
+            current_z_mm    = float(kv.get("z_mm", str(current_z_mm)))
+            current_step_no = int(kv.get("step", str(current_step_no)))
+
+        elif line.startswith("DIV_AXIS_BEGIN"):
+            kv = parse_keyvals(line)
+            current_z_mm    = float(kv.get("z_mm",  str(current_z_mm)))
+            current_step_no = int(kv.get("step",    str(current_step_no)))
+            current_axis    = int(kv.get("axis",    str(current_axis)))
+            
+        elif line.startswith("Z_MOVE_DONE"):
+            kv = parse_keyvals(line)
+            current_z_mm = float(kv.get("z_mm", str(current_z_mm)))
+            current_step_no = int(kv.get("step", str(current_step_no)))
+
+        elif line.startswith("RAW_SCAN_BEGIN"):
+            kv = parse_keyvals(line)
+
+            scan_axis = int(kv.get("axis", str(current_axis)))
+            scan_no   = int(kv.get("scan", "0"))
+
+            stride      = float(kv.get("stride", "1"))
+            emit_stride = float(kv.get("emit_stride", "1"))
+            sample_dt_ms = 1000.0 * RAW_SAMPLE_DT_S * stride * emit_stride
+
+            scan_key = (current_step_no, scan_axis, scan_no)
+
+            collector.start(
+                axis=scan_axis,
+                scan_no=scan_no,
+                sample_dt_ms=sample_dt_ms
+            )
+
+            scan_context[scan_key] = {
+                "z_mm": current_z_mm,
+                "step_no": current_step_no,
+            }
+
+        elif line.startswith("RAW_SCAN,"):
+            parts = line.split(",")
+            if len(parts) != 11:
+                continue
+            try:
+                collector.add(
+                    idx=int(parts[3]),
+                    enc=int(parts[4]),
+                    deg=float(parts[5]),
+                    x_mm=float(parts[6]),
+                    stage=int(parts[7]),
+                    raw=int(parts[8]),
+                    v=float(parts[9]),
+                    p_mw=float(parts[10]),
+                )
+            except ValueError:
+                continue
+            
+        elif line.startswith("T0_SCAN_INVALID"):
+            kv = parse_keyvals(line)
+            axis = int(kv.get("axis", "0"))
+            scan_no = int(kv.get("scan", "0"))
+            key = (current_step_no, axis, scan_no)
+
+            stm_invalid_scans.add(key)
+
+        elif line.startswith("RAW_SCAN_DONE"):
+            scan = collector.finalize()
+            if scan is not None:
+                key = (current_step_no, scan["axis"], scan["scan_no"])
+                raw_scans[key] = scan
+
+                if key in t0_results and key not in processed and key not in stm_invalid_scans:
+                    ctx = scan_context.get(key, {"z_mm": current_z_mm, "step_no": current_step_no})
+                    result = process_one_scan(
+                        raw_scans[key], t0_results[key],
+                        z_mm=ctx["z_mm"],
+                        step_no=ctx["step_no"],
+                        run_dir=run_dir,
+                    )
+                    results.append(result)
+                    processed.add(key)
+
+        elif line.startswith("T0_RESULT"):
+            kv      = parse_keyvals(line)
+            axis    = int(kv.get("axis", str(current_axis)))
+            scan_no = int(kv.get("scan", "0"))
+            key = (current_step_no, axis, scan_no)
+
+            t0_results[key] = {
+                "axis":      axis,
+                "scan":      scan_no,
+                "idx":       int(float(kv.get("idx",       "0"))),
+                "t0_ms":     float(kv.get("t0_ms",     "0")) if "t0_ms"     in kv else None,
+                "t0_enc":    int(float(kv.get("t0_enc", "0"))) if "t0_enc"  in kv else None,
+                "x0_counts": int(float(kv.get("x0_counts","0"))) if "x0_counts" in kv else None,
+            }
+
+            if key in raw_scans and key not in processed:
+                ctx = scan_context.get(key, {"z_mm": current_z_mm,
+                                             "step_no": current_step_no})
+                result = process_one_scan(
+                    raw_scans[key], t0_results[key],
+                    z_mm=ctx["z_mm"],
+                    step_no=ctx["step_no"],
+                    run_dir=run_dir,
+                )
+                results.append(result)
+                processed.add(key)
+
+        elif line.startswith("DIV_AXIS_FAIL"):
+            print(f"WARNING: axis failure reported: {line}")
+
+        elif line.startswith("T0_FAIL"):
+            print(f"WARNING: T0 failure reported: {line}")
+
+        elif line.startswith("DIVERGENCE_DONE"):
+            batch_done = True
+
+    return sorted(results, key=lambda r: (r["z_mm"], r["axis"], r["scan_no"]))
+
+
+def average_valid_scans_per_z_axis(results):
+    grouped = {}
+
+    for r in results:
+        key = (float(r["z_mm"]), int(r["axis"]))
+        grouped.setdefault(key, []).append(r)
+
+    averaged = []
+
+    for (z_mm, axis), scans in sorted(grouped.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        valid_scans = [r for r in scans if r["valid"]]
+
+        if not valid_scans:
+            averaged.append({
+                "z_mm": z_mm,
+                "step_no": min(r["step_no"] for r in scans),
+                "scan_no": -1,
+                "axis": axis,
+                "valid": False,
+                "invalid_reason": "no valid scans",
+                "deg_span": 0.0,
+                "samples": 0,
+                "t0_idx_python": 0,
+                "t0_idx_stm": 0,
+                "t0_ms_python": 0.0,
+                "t0_ms_stm": 0.0,
+                "t0_deg_python_local": 0.0,
+                "t0_x_mm_python_local": 0.0,
+                "t0_enc_python_local": 0,
+                "t0_enc_stm": 0,
+                "x0_counts_stm": 0,
+                "fit_x0_idx": 0.0,
+                "fit_w_idx": 0.0,
+                "fit_ylo": 0.0,
+                "fit_yhi": 0.0,
+                "fit_amp_mw": 0.0,
+                "sigma_mm": 0.0,
+                "width_4sigma_mm": 0.0,
+                "n_valid_scans": 0,
+                "n_total_scans": len(scans),
+            })
+            continue
+
+        averaged.append({
+            "z_mm": z_mm,
+            "step_no": min(r["step_no"] for r in valid_scans),
+            "scan_no": -1,
+            "axis": axis,
+            "valid": True,
+            "invalid_reason": "",
+            "deg_span": float(np.mean([r["deg_span"] for r in valid_scans])),
+            "samples": int(round(np.mean([r["samples"] for r in valid_scans]))),
+            "t0_idx_python": int(round(np.mean([r["t0_idx_python"] for r in valid_scans]))),
+            "t0_idx_stm": int(round(np.mean([
+                r["t0_idx_stm"] for r in valid_scans if r["t0_idx_stm"] is not None
+            ]))) if any(r["t0_idx_stm"] is not None for r in valid_scans) else 0,
+            "t0_ms_python": float(np.mean([r["t0_ms_python"] for r in valid_scans])),
+            "t0_ms_stm": float(np.mean([
+                r["t0_ms_stm"] for r in valid_scans if r["t0_ms_stm"] is not None
+            ])) if any(r["t0_ms_stm"] is not None for r in valid_scans) else 0.0,
+            "t0_deg_python_local": float(np.mean([r["t0_deg_python_local"] for r in valid_scans])),
+            "t0_x_mm_python_local": float(np.mean([r["t0_x_mm_python_local"] for r in valid_scans])),
+            "t0_enc_python_local": int(round(np.mean([r["t0_enc_python_local"] for r in valid_scans]))),
+            "t0_enc_stm": int(round(np.mean([
+                r["t0_enc_stm"] for r in valid_scans if r["t0_enc_stm"] is not None
+            ]))) if any(r["t0_enc_stm"] is not None for r in valid_scans) else 0,
+            "x0_counts_stm": int(round(np.mean([
+                r["x0_counts_stm"] for r in valid_scans if r["x0_counts_stm"] is not None
+            ]))) if any(r["x0_counts_stm"] is not None for r in valid_scans) else 0,
+            "fit_x0_idx": float(np.mean([r["fit_x0_idx"] for r in valid_scans])),
+            "fit_w_idx": float(np.mean([r["fit_w_idx"] for r in valid_scans])),
+            "fit_ylo": float(np.mean([r["fit_ylo"] for r in valid_scans])),
+            "fit_yhi": float(np.mean([r["fit_yhi"] for r in valid_scans])),
+            "fit_amp_mw": float(np.mean([r["fit_amp_mw"] for r in valid_scans])),
+            "sigma_mm": float(np.mean([r["sigma_mm"] for r in valid_scans])),
+            "width_4sigma_mm": float(np.mean([r["width_4sigma_mm"] for r in valid_scans])),
+            "n_valid_scans": len(valid_scans),
+            "n_total_scans": len(scans),
+        })
+
+    return averaged
+
+# =============================================================================
+# Main
+# =============================================================================
+def main():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir   = os.path.join(SAVE_DIR, f"divergence_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    print(f"Opening {PORT} @ {BAUD}")
+    ser = serial.Serial(PORT, BAUD, timeout=SERIAL_TIMEOUT_S)
+
+    try:
+        raw_results = run_divergence_batch(ser, run_dir)
+    finally:
+        ser.close()
+
+    results = average_valid_scans_per_z_axis(raw_results)
+
+    # -------------------------------------------------------------------------
+    # Console summary
+    # -------------------------------------------------------------------------
+    print("\n===== Divergence Summary =====")
+    z_positions = sorted(set(r["z_mm"] for r in results))
+
+    for z in z_positions:
+        print(f"\nZ = {z:.3f} mm")
+        z_results = sorted(
+            [r for r in results if r["z_mm"] == z],
+            key=lambda r: r["axis"]
+        )
+        for r in z_results:
+            tag = "OK" if r["valid"] else f"INVALID ({r['invalid_reason']})"
+            n_valid = r.get("n_valid_scans", 0)
+            n_total = r.get("n_total_scans", 0)
+            print(
+                f"  Axis {r['axis']}: "
+                f"T0_x={r['t0_x_mm_python_local']:.4f} mm  "
+                f"sigma_avg={r['sigma_mm']:.6f} mm  "
+                f"4sigma_avg={r['width_4sigma_mm']:.6f} mm  "
+                f"valid_scans={n_valid}/{n_total}  "
+                f"[{tag}]"
+            )
+
+    save_divergence_summary(results, run_dir)
+    save_invalid_scan_log(run_dir)
+
+    print("\nGenerating plots...")
+    plot_width_vs_z(results, run_dir)
+    plot_beam_profile_hourglass(results, run_dir)
+    plot_beam_3d(results, run_dir)
+    calculate_divergence(results, run_dir)
+
+    print(f"\nAll outputs saved in: {run_dir}")
+
+
+if __name__ == "__main__":
+    main()

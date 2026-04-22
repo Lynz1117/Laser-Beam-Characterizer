@@ -1,0 +1,285 @@
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+
+PORT = "COM9"
+BAUD = 115200
+ser = serial.Serial(PORT, BAUD, timeout=1)
+
+# -------------------------
+# Serial helpers / parsing
+# -------------------------
+def read_line():
+    s = ser.readline()
+    if not s:
+        return None
+    return s.decode(errors="ignore").strip()
+
+def parse_scan_begin(line):
+    """
+    Accept formats:
+
+    (A) Old:
+      SCAN_BEGIN,<id>,<FWD/REV>,<D_mm>,<steps_per_mm>,<decim>
+
+    (B) New (recommended):
+      SCAN_BEGIN,<id>,<FWD/REV>,<D_mm>,<steps_per_mm>,<dx_mm>
+    """
+    if not line.startswith("SCAN_BEGIN"):
+        return None
+
+    parts = line.split(",")
+    if len(parts) < 5:
+        return None
+
+    scan_id = int(parts[1])
+    direction = parts[2].strip().upper()
+    D_mm = float(parts[3])
+    steps_per_mm = float(parts[4])
+
+    # Optional 6th field: could be decim OR dx_mm
+    decim = 1
+    dx_mm = None
+
+    if len(parts) >= 6:
+        v = parts[5].strip()
+        # Heuristic: if it contains a decimal point and is small, treat as dx_mm
+        if ("." in v) or ("e" in v.lower()):
+            dx_mm = float(v)
+        else:
+            decim = int(v)
+            dx_mm = decim / steps_per_mm
+    else:
+        dx_mm = decim / steps_per_mm
+
+    return scan_id, direction, D_mm, steps_per_mm, decim, dx_mm
+
+def read_one_scan_after_begin(begin_info):
+    """
+    Reads ADC samples until SCAN_END
+    """
+    scan_id, direction, D_mm, steps_per_mm, decim, dx_mm = begin_info
+    adc = []
+
+    while True:
+        line = read_line()
+        if line is None:
+            continue
+        if line.startswith("SCAN_END"):
+            break
+        try:
+            adc.append(int(line))
+        except:
+            pass
+
+    return scan_id, direction, D_mm, steps_per_mm, decim, dx_mm, np.asarray(adc, dtype=float)
+
+# -------------------------
+# Processing
+# -------------------------
+def detrend_linear(x, y):
+    if len(y) < 3:
+        return y
+    p = np.polyfit(x, y, 1)
+    return y - (p[0]*x + p[1])
+
+def resample_to_common_grid(x, y, N=4096):
+    x_u = np.linspace(x.min(), x.max(), N)
+    y_u = np.interp(x_u, x, y)
+    return x_u, y_u
+
+def compute_spatial_fft(y_x, dx_mm):
+    """
+    Spatial FFT:
+      input is y(x) sampled uniformly in x with spacing dx_mm
+      returns fx [cycles/mm] and magnitude
+    """
+    N = len(y_x)
+    win = np.hanning(N)
+    Y = np.fft.rfft(y_x * win)
+    mag = np.abs(Y)
+    fx = np.fft.rfftfreq(N, d=dx_mm)  # cycles per mm
+    return fx, mag
+
+def estimate_wavelength_from_fx_peak(fx, mag, fx_min=0.05):
+    """
+    Michelson mapping:
+      fx = 2/lambda(mm)  -> lambda(mm) = 2/fx
+    """
+    valid = fx >= fx_min
+    if not np.any(valid):
+        return None, None, None
+
+    fx2 = fx[valid]
+    mag2 = mag[valid]
+    k = np.argmax(mag2)
+    fx_peak = fx2[k]
+    if fx_peak <= 0:
+        return None, None, None
+
+    lambda_mm = 2.0 / fx_peak
+    lambda_nm = lambda_mm * 1e6
+    return lambda_nm, fx_peak, mag2[k]
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    print("Sending GO...")
+    ser.write(b"GO\n")
+
+    scans = []
+
+    # Receive until ALL_DONE
+    while True:
+        line = read_line()
+        if line is None:
+            continue
+
+        if line.startswith("ALL_DONE"):
+            print("STM32 reports ALL_DONE")
+            break
+
+        info = parse_scan_begin(line)
+        if info is None:
+            continue
+
+        scan_id, direction, D_mm, steps_per_mm, decim, dx_mm, adc = read_one_scan_after_begin(info)
+
+        # build x(mm) per sample
+        x = np.arange(len(adc)) * dx_mm
+
+        # flip REV so all scans align 0 -> D
+        if direction == "REV":
+            adc = adc[::-1].copy()
+            x = np.arange(len(adc)) * dx_mm
+
+        scans.append({
+            "id": scan_id,
+            "dir": direction,
+            "D_mm": D_mm,
+            "steps_per_mm": steps_per_mm,
+            "decim": decim,
+            "dx_mm": dx_mm,
+            "x": x,
+            "adc": adc
+        })
+
+        print(f"Got scan {scan_id:03d} {direction} samples={len(adc)} dx={dx_mm:.9f} mm")
+
+    if len(scans) == 0:
+        print("No scans received.")
+        return
+
+    # ---- Average selection ----
+    average_forward_only = True  # set False if you want all half sweeps
+
+    if average_forward_only:
+        use = [s for s in scans if s["dir"] == "FWD"]
+        if len(use) == 0:
+            use = scans
+    else:
+        use = scans
+
+    # ---- common crop + resample ----
+    D_common = min(s["x"][-1] for s in use)
+    Ngrid = 4096
+
+    Y_list = []
+    dYdx_list = []
+
+    for s in use:
+        mask = s["x"] <= D_common
+        x = s["x"][mask]
+        y = s["adc"][mask]
+
+        y = detrend_linear(x, y)
+        x_u, y_u = resample_to_common_grid(x, y, N=Ngrid)
+        dYdx = np.gradient(y_u, x_u)
+
+        Y_list.append(y_u)
+        dYdx_list.append(dYdx)
+
+    Y = np.vstack(Y_list)
+    dYdx = np.vstack(dYdx_list)
+
+    y_avg = np.mean(Y, axis=0)
+    dYdx_avg = np.mean(dYdx, axis=0)
+
+    dx_grid = x_u[1] - x_u[0]
+
+    # ---- FFT on averaged derivative ----
+    fx, mag = compute_spatial_fft(dYdx_avg, dx_grid)
+    lambda_nm, fx_peak, mag_peak = estimate_wavelength_from_fx_peak(fx, mag, fx_min=0.05)
+
+    # ---- Plot layout like your screenshot ----
+    plt.ion()
+    fig = plt.figure(figsize=(13, 7))
+
+    ax1 = fig.add_subplot(2, 2, 1)  # averaged AC
+    ax2 = fig.add_subplot(2, 2, 2)  # averaged dI/dx
+    ax3 = fig.add_subplot(2, 2, 3)  # spatial FFT
+    ax4 = fig.add_subplot(2, 2, 4)  # wavelength text
+
+    ax1.plot(x_u, y_avg, lw=1)
+    ax1.set_title("Average AC signal vs distance (detrended)")
+    ax1.set_xlabel("Distance x (mm)")
+    ax1.set_ylabel("ADC counts (detrended)")
+    ax1.grid(True)
+
+    ax2.plot(x_u, dYdx_avg, lw=1)
+    ax2.set_title("Average derivative dI/dx")
+    ax2.set_xlabel("Distance x (mm)")
+    ax2.set_ylabel("d(ADC)/dx")
+    ax2.grid(True)
+
+    ax3.plot(fx, mag, lw=1)
+    ax3.set_title("Spatial FFT | averaged dI/dx")
+    ax3.set_xlabel("Spatial frequency (cycles/mm)")
+    ax3.set_ylabel("Magnitude")
+    ax3.grid(True)
+
+    if lambda_nm is not None:
+        ax3.axvline(fx_peak, linestyle="--")
+        ax3.text(fx_peak, np.max(mag)*0.8, f"{fx_peak:.4f} cyc/mm", rotation=90, va="top")
+
+    ax4.axis("off")
+    n_used = len(use)
+    total = len(scans)
+
+    if lambda_nm is None:
+        text = (
+            f"RESULTS\n\n"
+            f"Half-sweeps received: {total}\n"
+            f"Used for average: {n_used} ({'FWD only' if average_forward_only else 'ALL'})\n"
+            f"Common distance used: {D_common:.3f} mm\n"
+            f"dx grid: {dx_grid:.9f} mm\n\n"
+            f"Wavelength: FAILED\n\n"
+            f"Most common causes:\n"
+            f"• dx_mm wrong (lead screw/microstep mismatch)\n"
+            f"• not enough fringes over 20 mm\n"
+            f"• poor fringe contrast / saturation\n"
+        )
+    else:
+        text = (
+            f"RESULTS\n\n"
+            f"Half-sweeps received: {total}\n"
+            f"Used for average: {n_used} ({'FWD only' if average_forward_only else 'ALL'})\n"
+            f"Common distance used: {D_common:.3f} mm\n"
+            f"dx grid: {dx_grid:.9f} mm\n\n"
+            f"Peak spatial freq: {fx_peak:.6f} cycles/mm\n"
+            f"Estimated wavelength: {lambda_nm:.2f} nm\n\n"
+            f"Model: Michelson fx = 2 / λ(mm)\n"
+        )
+
+    ax4.text(0.02, 0.95, text, va="top", family="monospace", fontsize=12)
+
+    fig.suptitle("Interferometer Testing (Stepper Scan Average)", fontsize=16)
+    plt.tight_layout()
+    plt.show()
+
+    plt.ioff()
+    plt.show()
+
+if __name__ == "__main__":
+    main()
