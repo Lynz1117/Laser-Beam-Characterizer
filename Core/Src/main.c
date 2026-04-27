@@ -59,27 +59,27 @@
 
 // Stepper defines
 #define DIR_GPIO_Port  GPIOA
-#define DIR_Pin        GPIO_PIN_2
+#define DIR_Pin        GPIO_PIN_0
 
 #define STEP_GPIO_Port GPIOA
-#define STEP_Pin       GPIO_PIN_3
+#define STEP_Pin       GPIO_PIN_1
 
 #define SLEEP_GPIO_Port GPIOA
 #define SLEEP_Pin       GPIO_PIN_6
 
 // Divergence Stepper (z-stage)
 #define Z_DIR_GPIO_Port    GPIOA
-#define Z_DIR_Pin		   GPIO_PIN_0
+#define Z_DIR_Pin		   GPIO_PIN_4
 
 #define Z_STEP_GPIO_Port   GPIOA
-#define Z_STEP_Pin		   GPIO_PIN_1
+#define Z_STEP_Pin		   GPIO_PIN_5
 
-// STEPPER3
-#define DIR3_GPIO_Port  GPIOA
-#define DIR3_Pin        GPIO_PIN_4
+ //STEPPER3
+#define DIR2_GPIO_Port  GPIOC
+#define DIR2_Pin        GPIO_PIN_12
 
-#define STEP3_GPIO_Port GPIOA
-#define STEP3_Pin       GPIO_PIN_5
+#define STEP2_GPIO_Port GPIOB
+#define STEP2_Pin       GPIO_PIN_10
 
 // Homing Button
 #define BUTTON_GPIO_Port GPIOA
@@ -95,8 +95,8 @@
 #define Z_LEADSCREW_PITCH_MM     1.0f      // <-- change to your real leadscrew pitch
 #define Z_STEPS_PER_MM           ((Z_STEPS_PER_REV * Z_MICROSTEP_DIV) / Z_LEADSCREW_PITCH_MM)
 
-#define Z_HOME_DIR               0U        // change if motor moves wrong way toward switch
-#define Z_AWAY_DIR               1U
+#define Z_HOME_DIR               1U        // change if motor moves wrong way toward switch
+#define Z_AWAY_DIR               0U
 
 #define Z_HOME_MAX_STEPS         50000U    // safety limit
 #define Z_HOME_BACKOFF_STEPS     1000U
@@ -112,15 +112,16 @@
 // =============================
 // Divergence settings
 // =============================
-#define DIVERGENCE_STEP_MM        20.0f
-#define DIVERGENCE_TOTAL_MM       200.0f
+#define DIVERGENCE_STEP_MM        10.0f
+#define DIVERGENCE_TOTAL_MM       100.0f
 #define DIVERGENCE_NUM_POSITIONS  ((uint32_t)(DIVERGENCE_TOTAL_MM / DIVERGENCE_STEP_MM))
 
 // =============================
 // M2 settings
 // =============================
-#define M2_STEP_MM                10.0f
 #define M2_TOTAL_MM               300.0f
+#define M2_COARSE_POINTS          10U
+#define M2_STEP_MM                (M2_TOTAL_MM / (float)M2_COARSE_POINTS)
 #define M2_MAX_POSITIONS          64U
 #define M2_ISO_TARGET_POINTS      10U
 #define M2_ISO_POINTS_INSIDE      5U
@@ -147,7 +148,7 @@
 #define ADC_HALF_LEN            (ADC_BUF_LEN / 2)
 
 // ADC conversion
-#define ADC_VREF                3.3f
+#define ADC_VREF                2.9f
 #define ADC_MAX_COUNTS          4095.0f
 #define PM_VOLTAGE_OFFSET_V     (0.0f)
 
@@ -181,6 +182,7 @@
 #define PROFILE_CLEAR_CONFIRM_COUNT   50U
 #define PROFILE_CLEAR_TIMEOUT_MS      5000U
 #define PROFILE_CLEAR_THRESH_FRAC     0.55f
+#define PROFILE_CLEAR_THRESHOLD_MW	  0.05f
 
 #define PROFILE_RPM_TOLERANCE_RPM      0.45f
 #define PROFILE_RPM_STABLE_COUNT_REQ   3U
@@ -194,11 +196,12 @@
 #define T0_FIT_W_STEP_INIT     60.0f
 #define T0_FIT_W_MIN           2.0f
 
-#define PROFILE_INIT_COUNTS     7000
+#define PROFILE_INIT_COUNTS     7778
 #define PROFILE_REPEAT_COUNTS    745
-#define PROFILE_EVENT_COUNTS    7000
+#define PROFILE_EVENT_COUNTS    7778
 #define PROFILE_WAIT_COUNTS    (PROFILE_EVENT_COUNTS - PROFILE_REPEAT_COUNTS)   // 6255
-#define T0_BATCH_MAX_ATTEMPTS  30U   // add near other defines at top
+#define T0_BATCH_MAX_ATTEMPTS  60U   // add near other defines at top
+#define PROFILE_EDGE_MARGIN_DEG	5.0f // degrees to exclude at each edge
 
 #define PROFILE_CAPTURE_MAX_SAMPLES   10000U
 #define PROFILE_REPEAT_BUFFER_MAX_REPEAT_SCANS     10U
@@ -207,17 +210,30 @@
 #define PROFILE_REPEAT_BUFFER_TOTAL_POINTS         (PROFILE_REPEAT_BUFFER_MAX_SCANS * PROFILE_REPEAT_BUFFER_MAX_POINTS_PER_SCAN)
 
 // ADC sample rate used for profile timestamps
-#define ADC_FS_HZ               20000.0f
+#define ADC_FS_HZ               10000.0f
 #define ADC_DT_S                (1.0f / ADC_FS_HZ)
 
 // Wavelength ADC
 #define FFT_ADC_FS_HZ			200000.0f
-#define FFT_SAMPLES				1024U 	// power of 2
+#define FFT_SAMPLES				4096U 	// power of 2
 
 /* Chunk-based streaming FFT */
-#define FFT_CHUNK_SIZE      1024U
+#define FFT_CHUNK_SIZE      4096U
 #define FFT_CHUNK_HALF      (FFT_CHUNK_SIZE / 2U)
 
+#define WL_WINDOW_SAMPLES      60000U
+#define WL_WINDOW_HALF_CHUNKS  ((WL_WINDOW_SAMPLES + FFT_CHUNK_HALF - 1U) / FFT_CHUNK_HALF)
+
+// NEW WAVELENGTH DEFINES
+#define WL_RAW_MAGIC0              0xAA
+#define WL_RAW_MAGIC1              0x55
+#define WL_RAW_PACKET_TYPE_ADC     0x01
+
+#define WL_WINDOW_SAMPLES          60000U
+#define WL_WINDOW_TIME_S           ((float)WL_WINDOW_SAMPLES / FFT_ADC_FS_HZ)
+#define WL_WALL_GUARD_S            WL_WINDOW_TIME_S
+
+#define WL_USB_FLUSH_DELAY_MS      500U
 /* Optical conversion
    Whiteboard shows lambda = 2*v/favg.
    If your final setup is one-pass, change to 1.0f.
@@ -228,7 +244,7 @@
 #define STEP3_FULL_STEPS_PER_REV    200.0f
 #define STEP3_MICROSTEP_DIV         1.0f     // set to your actual microstep setting
 #define STEP3_LEADSCREW_PITCH_MM    1.0f
-#define STEP3_SPEED_MM_S            10.0f
+#define STEP3_SPEED_MM_S            7.5f
 
 #define STEP3_STEPS_PER_MM \
     ((STEP3_FULL_STEPS_PER_REV * STEP3_MICROSTEP_DIV) / STEP3_LEADSCREW_PITCH_MM)
@@ -261,11 +277,11 @@
 #define PROFILE_SYNTH_POWER_FULL_SCALE_MW 600.0f
 #define PROFILE_SYNTH_REPLAY_LUT_LEN      64U
 #if PROFILE_SYNTHETIC_RAW_ENABLE
-#define PROFILE_CAPTURE_STORE_STRIDE      4U
-#define PROFILE_HOST_EMIT_STRIDE          8U
+#define PROFILE_CAPTURE_STORE_STRIDE      3U
+#define PROFILE_HOST_EMIT_STRIDE          2U
 #else
-#define PROFILE_CAPTURE_STORE_STRIDE      4U
-#define PROFILE_HOST_EMIT_STRIDE          8U
+#define PROFILE_CAPTURE_STORE_STRIDE      1U
+#define PROFILE_HOST_EMIT_STRIDE          1U
 #endif
 
 // Beam-profile output decimation
@@ -275,6 +291,9 @@
 #define STEP_PROFILE_NUM_STEPS       200U      // steps per Z move  <-- change here
 #define STEP_PROFILE_NUM_POSITIONS   10U       // total positions   <-- change here
 #define STEP_PROFILE_AXIS            PROFILE_AXIS_M1  // which axis
+
+#define PROFILE_WORK_MAX_SAMPLES 	6000U
+#define T0_DUMP_HALF_WINDOW			1250U
 
 // Commands
 #define PROFILE_CMD_STR         "PROFILE"
@@ -287,6 +306,7 @@
 #define HOME_STEPPER			"HOME"
 #define DIVERGENCE_CMD_STR		"DIVERGENCE"
 #define M2_CMD_STR               "M2"
+#define M2_POS_CMD_PREFIX        "M2POS,"
 #define WAVELENGTH_CMD_STR		"Wavelength"
 #define STEP_PROFILE_CMD_STR	"STEPPROFILE"
 /* USER CODE END PD */
@@ -492,6 +512,16 @@ volatile uint8_t         fft_chunk_half_ready  = 0U;
 volatile uint8_t         fft_chunk_full_ready  = 0U;
 volatile uint32_t        fft_chunks_processed  = 0U;
 
+// NEW
+static void wl_send_raw_packet(uint32_t window_id,
+                               uint32_t chunk_id,
+                               const uint16_t *samples,
+                               uint32_t n);
+
+static void wl_process_dma_for_window(uint32_t window_id,
+                                      uint32_t *chunk_id,
+                                      uint32_t *samples_this_window);
+// END
 
 static arm_rfft_fast_instance_f32 fft_inst;
 
@@ -539,7 +569,7 @@ static uint8_t beam_profile_window_done_counts(void);
 static void beam_profile_start_window_counts(int32_t span_counts);
 
 // One shared float scratch buffer for host-side optional local preprocessing if needed
-static float profile_work_buf[PROFILE_CAPTURE_MAX_SAMPLES];
+static float profile_work_buf[PROFILE_WORK_MAX_SAMPLES];
 static void t0_emit_raw_scan(ProfileAxis_t axis);
 static void host_profile_learn_clear_threshold_from_initial_scan(void);
 static void clear_active_axis_out_of_beam(void);
@@ -547,6 +577,7 @@ static void clear_active_axis_out_of_beam(void);
 volatile uint8_t start_step_profile_flag = 0U;
 
 uint32_t t0_raw_count = 0U;
+static uint32_t t0_dump_win_end = 0U;
 
 // Stokes buffers
 uint16_t stokes_I[NUM_STOKES_SAMPLES];
@@ -568,13 +599,18 @@ static void z_move_mm(float mm);
 static float z_current_mm = 0.0f;
 volatile uint8_t start_divergence_flag = 0;
 volatile uint8_t start_m2_flag = 0;
+volatile uint8_t start_m2_position_flag = 0U;
 volatile uint8_t divergence_busy = 0U;
 static void z_move_mm_dir(uint8_t dir, float mm);
 static uint8_t divergence_capture_both_axes_at_z(uint32_t step_index);
+static uint8_t m2_capture_both_axes_at_z(uint32_t step_index);
 static uint8_t run_divergence_measurement(float step_mm, float total_mm);
 static uint8_t run_m2_measurement(float step_mm, float total_mm);
+static uint8_t run_m2_capture_at_position(float target_mm, uint32_t step_index);
 static uint8_t run_step_and_profile(uint32_t num_steps, uint32_t num_positions, ProfileAxis_t axis);
 volatile uint8_t start_step_div_flag = 0U;
+static float m2_target_z_mm = 0.0f;
+static uint32_t m2_target_step_index = 0U;
 
 
 static float compute_d4sigma_mm_from_raw_scan(
@@ -788,6 +824,31 @@ static float z_plot_mm(void);
 #include <math.h>
 #include <stdlib.h>
 
+// Binary Packet Sender
+static void wl_send_raw_packet(uint32_t window_id,
+                               uint32_t chunk_id,
+                               const uint16_t *samples,
+                               uint32_t n)
+{
+    uint8_t header[16];
+
+    if (samples == NULL || n == 0U)
+        return;
+
+    header[0] = WL_RAW_MAGIC0;
+    header[1] = WL_RAW_MAGIC1;
+    header[2] = WL_RAW_PACKET_TYPE_ADC;
+    header[3] = 0x00;
+
+    memcpy(&header[4],  &window_id, 4);
+    memcpy(&header[8],  &chunk_id,  4);
+    memcpy(&header[12], &n,         4);
+
+    CDC_Enqueue_TX(header, sizeof(header));
+    CDC_Enqueue_TX((const uint8_t *)samples, (uint16_t)(n * sizeof(uint16_t)));
+    CDC_TX_Kick();
+}
+
 // -----------------------------
 // Stepper helpers
 // -----------------------------
@@ -854,19 +915,18 @@ static inline void stepper_sleep_disable(void)
     HAL_GPIO_WritePin(SLEEP_GPIO_Port, SLEEP_Pin, GPIO_PIN_RESET);
 }
 
-static inline void stepper3_sleep_wake(void)
+static inline void drv2_set_dir(uint8_t dir)
 {
-    HAL_GPIO_WritePin(SLEEP_GPIO_Port, SLEEP_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(DIR2_GPIO_Port, DIR2_Pin, dir ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-static inline void stepper3_sleep_disable(void)
+static void stepper_ramp_to_speed(uint32_t target_period_us)
 {
-    HAL_GPIO_WritePin(SLEEP_GPIO_Port, SLEEP_Pin, GPIO_PIN_RESET);
-}
-
-static inline void drv3_set_dir(uint8_t dir)
-{
-    HAL_GPIO_WritePin(DIR3_GPIO_Port, DIR3_Pin, dir ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    for (uint32_t d = 2000U; d > target_period_us; d -= 50U)
+    {
+        step_pulse();
+        delay_us(d);
+    }
 }
 
 // -----------------------------
@@ -889,11 +949,11 @@ static void z_step_pulse(void)
     HAL_GPIO_WritePin(Z_STEP_GPIO_Port, Z_STEP_Pin, GPIO_PIN_RESET);
 }
 
-static void step3_pulse(void)
+static void step2_pulse(void)
 {
-    HAL_GPIO_WritePin(STEP3_GPIO_Port, STEP3_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(STEP2_GPIO_Port, STEP2_Pin, GPIO_PIN_SET);
     delay_us(10);
-    HAL_GPIO_WritePin(STEP3_GPIO_Port, STEP3_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(STEP2_GPIO_Port, STEP2_Pin, GPIO_PIN_RESET);
 }
 
 
@@ -930,12 +990,23 @@ static void z_move_steps(uint32_t n)
     }
 }
 
-static void move3_steps(uint32_t n)
+static void move2_steps(uint32_t n)
 {
     for (uint32_t i = 0; i < n; i++)
     {
-        step3_pulse();
-        HAL_Delay(STEP_DELAY_MS);
+        step2_pulse();
+        HAL_Delay(1);
+    }
+}
+
+static void step2_ramp_to_speed(uint32_t target_period_us)
+{
+    uint32_t d;
+
+    for (d = 5000U; d > target_period_us; d -= 10U)
+    {
+        step2_pulse();
+        delay_us(d);
     }
 }
 
@@ -1797,10 +1868,8 @@ static void do_stokes_scan(void)
     // Signal end of scan
     printf("STOKES_DONE\r\n");
 
-    stepper_sleep_disable();
-
     // Disable stepper motor to reduce heating
-//    stepper_disable();
+    stepper_sleep_disable();
 }
 
 // -----------------------------
@@ -3118,35 +3187,85 @@ static int32_t interp_encoder_count_at_index(const int32_t *enc_buf, uint32_t n,
 // -----------------------------
 // FINDING T0 Helpers
 // -----------------------------
-static void t0_batch_begin(ProfileAxis_t axis, uint8_t num_scans)
+static void t0_batch_begin(ProfileAxis_t axis, uint8_t num_valid_scans)
 {
-    t0_batch_active      = 1U;
-    t0_batch_axis        = (uint8_t)axis;
-    t0_batch_num_scans   = num_scans;
-    t0_batch_scan_index  = 0U;
-    t0_batch_valid_scans = 0U;
-    t0_batch_total_axes  = 1U;   // default: single axis; set to 2 externally if needed
-
-    profiler.axis        = axis;
-    host_local_t0_ready  = 0U;
-
-    if (t0_batch_num_scans > 10U) t0_batch_num_scans = 10U;
-    if (t0_batch_num_scans == 0U) t0_batch_num_scans = 1U;
-
-    profile_locked_rpm           = 0.0f;
-    profile_locked_omega_rad_s   = 0.0f;
-    profile_rpm_stable_count     = 0U;
-
-    dc_motor_start_profile_axis(axis);
-    HAL_Delay(PROFILE_SPINUP_MS);
-    reset_axis_encoder(axis);
-
+    t0_batch_active = 1U;
     t0_batch_state = T0_BATCH_WAIT_STABLE;
 
+    profiler.axis = axis;
+    t0_batch_axis = (uint8_t)axis;
+    t0_batch_num_scans = num_valid_scans;
+    t0_batch_scan_index = 0U;
+    t0_batch_valid_scans = 0U;
+
+    host_local_t0_ready = 0U;
+    profiler.t0_idx = 0U;
+    profiler.t0_enc_count = 0;
+    profiler.x0_counts = 0;
+    profiler.xdelay_counts = 0;
+    profiler.next_scan_enc_target = 0;
+
+    profile_locked_rpm = 0.0f;
+    profile_locked_omega_rad_s = 0.0f;
+    profile_rpm_stable_count = 0U;
+
+    host_repeat_buffer_reset();
+
+    dc_motor_start_profile_axis(axis);   // start motor ONCE
+    HAL_Delay(PROFILE_SPINUP_MS);        // spin up ONCE
+
+    reset_axis_encoder(axis);
+    if (axis == PROFILE_AXIS_M1)
+    {
+        dc1.prev_count = enc_read_axis_count(PROFILE_AXIS_M1);
+        dc1.delta_count = 0;
+        dc1.rpm = 0.0f;
+        dc1.omega = 0.0f;
+    }
+    else
+    {
+        dc2.prev_count = enc_read_axis_count(PROFILE_AXIS_M2);
+        dc2.delta_count = 0;
+        dc2.rpm = 0.0f;
+        dc2.omega = 0.0f;
+    }
+
+    last_dc_speed_ms = HAL_GetTick();
+
     printf("T0_BATCH_BEGIN,axis=%u,num_scans=%u\r\n",
-           (unsigned int)axis,
+           (unsigned int)t0_batch_axis,
            (unsigned int)t0_batch_num_scans);
 }
+
+//static void t0_batch_begin(ProfileAxis_t axis, uint8_t num_scans)
+//{
+//    t0_batch_active      = 1U;
+//    t0_batch_axis        = (uint8_t)axis;
+//    t0_batch_num_scans   = num_scans;
+//    t0_batch_scan_index  = 0U;
+//    t0_batch_valid_scans = 0U;
+//    t0_batch_total_axes  = 1U;   // default: single axis; set to 2 externally if needed
+//
+//    profiler.axis        = axis;
+//    host_local_t0_ready  = 0U;
+//
+//    if (t0_batch_num_scans > 10U) t0_batch_num_scans = 10U;
+//    if (t0_batch_num_scans == 0U) t0_batch_num_scans = 1U;
+//
+//    profile_locked_rpm           = 0.0f;
+//    profile_locked_omega_rad_s   = 0.0f;
+//    profile_rpm_stable_count     = 0U;
+//
+//    dc_motor_start_profile_axis(axis);
+//    HAL_Delay(PROFILE_SPINUP_MS);
+//    reset_axis_encoder(axis);
+//
+//    t0_batch_state = T0_BATCH_WAIT_STABLE;
+//
+//    printf("T0_BATCH_BEGIN,axis=%u,num_scans=%u\r\n",
+//           (unsigned int)axis,
+//           (unsigned int)t0_batch_num_scans);
+//}
 
 //static void t0_batch_begin(ProfileAxis_t axis, uint8_t num_valid_scans)
 //{
@@ -3191,75 +3310,163 @@ static uint8_t t0_batch_scan_is_valid(void)
     return 1U;
 }
 
+//static uint8_t t0_dump_scan_step(ProfileAxis_t axis, uint8_t scan_no)
+//{
+//    float counts_per_rev = profile_get_active_counts_per_rev();
+//    uint32_t emitted_n = 0U;
+//    uint32_t lines_this_call = 0U;
+//    const uint32_t max_lines_per_call = 8U;
+//
+//    if (!t0_dump_started)
+//    {
+//        t0_dump_emit_stride = 1U;
+//        while ((profile_raw_count / t0_dump_emit_stride) > 300U)
+//            t0_dump_emit_stride++;
+//
+//        t0_dump_idx = 0U;
+//        t0_dump_started = 1U;
+//
+//        printf("RAW_SCAN_BEGIN,axis=%u,scan=%u,stride=1,emit_stride=%lu\r\n",
+//               (unsigned int)axis,
+//               (unsigned int)scan_no,
+//               (unsigned long)t0_dump_emit_stride);
+//    }
+//
+//    while ((t0_dump_idx < profile_raw_count) && (lines_this_call < max_lines_per_call))
+//    {
+//        uint32_t i = t0_dump_idx;
+//        int32_t enc = profile_raw_enc_buf[i];
+//
+//        float deg = profile_counts_to_deg(
+//            enc,
+//            profiler.scan_start_enc_count,
+//            counts_per_rev
+//        );
+//
+//        float x_mm = profile_counts_to_x_mm(
+//            enc,
+//            profiler.scan_start_enc_count,
+//            counts_per_rev
+//        );
+//
+//        float v = adc_counts_to_voltage((float)profile_raw_power_buf[i]);
+//        float p = voltage_to_power_mw_for_stage(v, profile_raw_stage_buf[i]);
+//
+//        printf("RAW_SCAN,%u,%u,%lu,%ld,%.6f,%.6f,%u,%u,%.6f,%.6f\r\n",
+//               (unsigned int)axis,
+//               (unsigned int)scan_no,
+//               (unsigned long)i,
+//               (long)enc,
+//               deg,
+//               x_mm,
+//               (unsigned int)profile_raw_stage_buf[i],
+//               (unsigned int)profile_raw_power_buf[i],
+//               v,
+//               p);
+//
+//        t0_dump_idx += t0_dump_emit_stride;
+//        lines_this_call++;
+//
+//        if ((lines_this_call % 4) == 0U)
+//			CDC_TX_Kick();
+//    }
+//
+//    if (t0_dump_idx >= profile_raw_count)
+//    {
+//        emitted_n = (profile_raw_count + t0_dump_emit_stride - 1U) / t0_dump_emit_stride;
+//        CDC_TX_Kick();
+//
+//        printf("RAW_SCAN_DONE,axis=%u,scan=%u,n=%lu\r\n",
+//               (unsigned int)axis,
+//               (unsigned int)scan_no,
+//               (unsigned long)emitted_n);
+//        CDC_TX_Kick();
+//
+//        t0_dump_started = 0U;
+//        t0_dump_idx = 0U;
+//        return 1U;
+//    }
+//
+//    return 0U;
+//}
+
 static uint8_t t0_dump_scan_step(ProfileAxis_t axis, uint8_t scan_no)
 {
-    float counts_per_rev = profile_get_active_counts_per_rev();
-    uint32_t emitted_n = 0U;
+    float    counts_per_rev = profile_get_active_counts_per_rev();
     uint32_t lines_this_call = 0U;
-    const uint32_t max_lines_per_call = 16U;
+    const uint32_t max_lines_per_call = 8U;
 
     if (!t0_dump_started)
     {
+        uint32_t n = profile_raw_count;
+
+        t0_dump_idx         = 0U;
+        t0_dump_win_end     = n;
         t0_dump_emit_stride = 1U;
-        while ((profile_raw_count / t0_dump_emit_stride) > 600U)
-            t0_dump_emit_stride++;
+        t0_dump_started     = 1U;
 
-        t0_dump_idx = 0U;
-        t0_dump_started = 1U;
+        CDC_TX_Kick();
+        HAL_Delay(2);
 
-        printf("RAW_SCAN_BEGIN,axis=%u,scan=%u,stride=1,emit_stride=%lu\r\n",
+        printf("RAW_SCAN_BEGIN,axis=%u,scan=%u,stride=%lu,emit_stride=1,"
+               "t0_idx=%lu,win_start=0,win_end=%lu,n=%lu,full_window=1\r\n",
                (unsigned int)axis,
                (unsigned int)scan_no,
-               (unsigned long)t0_dump_emit_stride);
+               (unsigned long)PROFILE_CAPTURE_STORE_STRIDE,
+               (unsigned long)profiler.t0_idx,
+               (unsigned long)n,
+               (unsigned long)n);
+
+        CDC_TX_Kick();
+        return 0U;
     }
 
-    while ((t0_dump_idx < profile_raw_count) && (lines_this_call < max_lines_per_call))
+    while ((t0_dump_idx < t0_dump_win_end) && (lines_this_call < max_lines_per_call))
     {
-        uint32_t i = t0_dump_idx;
-        int32_t enc = profile_raw_enc_buf[i];
+        uint32_t i   = t0_dump_idx;
+        int32_t  enc = profile_raw_enc_buf[i];
 
-        float deg = profile_counts_to_deg(
-            enc,
-            profiler.scan_start_enc_count,
-            counts_per_rev
-        );
-
-        float x_mm = profile_counts_to_x_mm(
-            enc,
-            profiler.scan_start_enc_count,
-            counts_per_rev
-        );
-
-        float v = adc_counts_to_voltage((float)profile_raw_power_buf[i]);
-        float p = voltage_to_power_mw_for_stage(v, profile_raw_stage_buf[i]);
+        float deg  = profile_counts_to_deg(enc,
+                         profiler.scan_start_enc_count, counts_per_rev);
+        float x_mm = profile_counts_to_x_mm(enc,
+                         profiler.scan_start_enc_count, counts_per_rev);
+        float v    = adc_counts_to_voltage((float)profile_raw_power_buf[i]);
+        float p    = voltage_to_power_mw_for_stage(v, profile_raw_stage_buf[i]);
 
         printf("RAW_SCAN,%u,%u,%lu,%ld,%.6f,%.6f,%u,%u,%.6f,%.6f\r\n",
                (unsigned int)axis,
                (unsigned int)scan_no,
                (unsigned long)i,
                (long)enc,
-               deg,
-               x_mm,
+               deg, x_mm,
                (unsigned int)profile_raw_stage_buf[i],
                (unsigned int)profile_raw_power_buf[i],
-               v,
-               p);
+               v, p);
 
-        t0_dump_idx += t0_dump_emit_stride;
+        t0_dump_idx++;
         lines_this_call++;
+
+        if ((lines_this_call % 4U) == 0U)
+            CDC_TX_Kick();
     }
 
-    if (t0_dump_idx >= profile_raw_count)
+    if (t0_dump_idx >= t0_dump_win_end)
     {
-        emitted_n = (profile_raw_count + t0_dump_emit_stride - 1U) / t0_dump_emit_stride;
+        uint32_t emitted_n = t0_dump_win_end;
 
-        printf("RAW_SCAN_DONE,axis=%u,scan=%u,n=%lu\r\n",
+        CDC_TX_Kick();
+
+        printf("RAW_SCAN_DONE,axis=%u,scan=%u,n=%lu,full_window=1\r\n",
                (unsigned int)axis,
                (unsigned int)scan_no,
                (unsigned long)emitted_n);
 
+        CDC_TX_Kick();
+
         t0_dump_started = 0U;
-        t0_dump_idx = 0U;
+        t0_dump_idx     = 0U;
+        t0_dump_win_end = 0U;
+
         return 1U;
     }
 
@@ -3332,13 +3539,13 @@ static void t0_batch_update(void)
             live_power_update_service();
             beam_profile_sample_position_window();
 
-            if (profile_raw_count >= PROFILE_CAPTURE_MAX_SAMPLES)
+            if (profile_raw_count > PROFILE_CAPTURE_MAX_SAMPLES)
             {
                 printf("T0_SCAN_OVERFLOW,axis=%u,scan=%u,n=%lu\r\n",
                        (unsigned int)t0_batch_axis,
                        (unsigned int)t0_batch_scan_index,
                        (unsigned long)profile_raw_count);
-                t0_batch_state = T0_BATCH_DONE;
+                t0_batch_state = T0_BATCH_NEXT;
                 break;
             }
 
@@ -3356,39 +3563,38 @@ static void t0_batch_update(void)
         // --------------------------------------------------
         // Run erf-fit T0 finder on the captured data.
         // --------------------------------------------------
-        case T0_BATCH_COMPUTE:
-        {
-            int32_t counts_travelled = enc_delta_counts(
-                profiler.scan_end_enc_count,
-                profiler.scan_start_enc_count
-            );
-            if (counts_travelled < 0)
-                counts_travelled = -counts_travelled;
-
-            if (counts_travelled < (PROFILE_INIT_COUNTS / 2))
-            {
-                printf("T0_SCAN_INVALID,axis=%u,scan=%u,counts=%ld,valid_so_far=%u\r\n",
-                       (unsigned int)t0_batch_axis,
-                       (unsigned int)t0_batch_scan_index,
-                       (long)counts_travelled,
-                       (unsigned int)t0_batch_valid_scans);
-
-                // Don't dump bad scan data, go straight to next
-                t0_batch_state = T0_BATCH_NEXT;
-                break;
-            }
-
-            // Valid scan — run the fit and count it
-            host_profile_compute_local_t0();
-
-            t0_result_idx[t0_batch_valid_scans]       = profiler.t0_idx;
-            t0_result_enc[t0_batch_valid_scans]        = profiler.t0_enc_count;
-            t0_result_x0_counts[t0_batch_valid_scans] = profiler.x0_counts;
-            t0_result_ms[t0_batch_valid_scans]         = profiler.t0_s * 1000.0f;
-
-            t0_batch_state = T0_BATCH_DUMP;
-            break;
-        }
+//        case T0_BATCH_COMPUTE:
+//        {
+//            int32_t counts_travelled = enc_delta_counts(
+//                profiler.scan_end_enc_count,
+//                profiler.scan_start_enc_count
+//            );
+//            if (counts_travelled < 0)
+//                counts_travelled = -counts_travelled;
+//
+//            if (counts_travelled < (PROFILE_INIT_COUNTS / 2))
+//            {
+//                printf("T0_SCAN_INVALID...\n");
+//
+//                // IMPORTANT: do NOT count this as a full attempt
+//                if (t0_batch_scan_index > 0)
+//                    t0_batch_scan_index--;   // undo attempt increment
+//
+//                t0_batch_state = T0_BATCH_NEXT;
+//                break;
+//            }
+//
+//            // Valid scan — run the fit and count it
+//            host_profile_compute_local_t0();
+//
+//            t0_result_idx[t0_batch_valid_scans]       = profiler.t0_idx;
+//            t0_result_enc[t0_batch_valid_scans]        = profiler.t0_enc_count;
+//            t0_result_x0_counts[t0_batch_valid_scans] = profiler.x0_counts;
+//            t0_result_ms[t0_batch_valid_scans]         = profiler.t0_s * 1000.0f;
+//
+//            t0_batch_state = T0_BATCH_DUMP;
+//            break;
+//        }
 
 //        case T0_BATCH_COMPUTE:
 //        {
@@ -3447,12 +3653,88 @@ static void t0_batch_update(void)
 //        }
 //        break;
 
+        case T0_BATCH_COMPUTE:
+        {
+            float counts_per_rev       = profile_get_active_counts_per_rev();
+            float edge_margin_counts   = (PROFILE_EDGE_MARGIN_DEG / 360.0f) * counts_per_rev;
+
+            int32_t counts_travelled = enc_delta_counts(
+                profiler.scan_end_enc_count,
+                profiler.scan_start_enc_count
+            );
+            if (counts_travelled < 0)
+                counts_travelled = -counts_travelled;
+
+            // check scan travelled enough counts
+            if (counts_travelled < (PROFILE_INIT_COUNTS / 2))
+            {
+                printf("T0_SCAN_INVALID,axis=%u,scan=%u,reason=short_scan,counts=%ld\r\n",
+                       (unsigned int)t0_batch_axis,
+                       (unsigned int)t0_batch_scan_index,
+                       (long)counts_travelled);
+
+                if (t0_batch_scan_index > 0)
+                    t0_batch_scan_index--;
+
+                t0_batch_state = T0_BATCH_NEXT;
+                break;
+            }
+
+            // run erf fit and find T0
+            host_profile_compute_local_t0();
+
+            // check T0 not within edge margin
+            int32_t counts_from_start = enc_delta_counts(
+                profiler.t0_enc_count,
+                profiler.scan_start_enc_count
+            );
+            if (counts_from_start < 0)
+                counts_from_start = -counts_from_start;
+
+            int32_t counts_from_end = enc_delta_counts(
+                profiler.scan_end_enc_count,
+                profiler.t0_enc_count
+            );
+            if (counts_from_end < 0)
+                counts_from_end = -counts_from_end;
+
+            if ((float)counts_from_start < edge_margin_counts ||
+                (float)counts_from_end   < edge_margin_counts)
+            {
+                printf("T0_SCAN_INVALID,axis=%u,scan=%u,"
+                       "reason=t0_near_edge,"
+                       "from_start=%ld,from_end=%ld,margin=%.0f\r\n",
+                       (unsigned int)t0_batch_axis,
+                       (unsigned int)t0_batch_scan_index,
+                       (long)counts_from_start,
+                       (long)counts_from_end,
+                       edge_margin_counts);
+
+                if (t0_batch_scan_index > 0)
+                    t0_batch_scan_index--;
+
+                t0_batch_state = T0_BATCH_NEXT;
+                break;
+            }
+
+            // valid — store results
+            t0_result_idx[t0_batch_valid_scans]       = profiler.t0_idx;
+            t0_result_enc[t0_batch_valid_scans]        = profiler.t0_enc_count;
+            t0_result_x0_counts[t0_batch_valid_scans] = profiler.x0_counts;
+            t0_result_ms[t0_batch_valid_scans]         = profiler.t0_s * 1000.0f;
+
+            t0_batch_state = T0_BATCH_DUMP;
+            break;
+        }
+
         // --------------------------------------------------
         // Stream raw scan to host in small non-blocking bursts.
         // --------------------------------------------------
         case T0_BATCH_DUMP:
+        	CDC_TX_Kick();
             if (t0_dump_scan_step((ProfileAxis_t)t0_batch_axis, t0_batch_valid_scans))
             {
+            	CDC_TX_Kick();
                 printf("T0_RESULT,axis=%u,scan=%u,idx=%lu,t0_enc=%ld,x0_counts=%ld,t0_ms=%.6f\r\n",
                        (unsigned int)t0_batch_axis,
                        (unsigned int)t0_batch_valid_scans,   // <-- valid index not raw index
@@ -3460,6 +3742,8 @@ static void t0_batch_update(void)
                        (long)t0_result_enc[t0_batch_valid_scans],
                        (long)t0_result_x0_counts[t0_batch_valid_scans],
                        t0_result_ms[t0_batch_valid_scans]);
+
+                CDC_TX_Kick();
 
                 t0_batch_valid_scans++;   // only increment after confirmed valid + dumped
                 t0_batch_state = T0_BATCH_NEXT;
@@ -3705,7 +3989,15 @@ static void t0_batch_update(void)
             printf("T0_BATCH_DONE,axis=%u,num_scans=%u\r\n",
                    (unsigned int)t0_batch_axis,
                    (unsigned int)t0_batch_num_scans);
+            // flush USB TX before signnalling done to Python
+            for(uint32_t flush_i = 0U; flush_i < 10U; flush_i++)
+            {
+            	CDC_TX_Kick();
+            	HAL_Delay(5);
+            }
+
             printf("T0_BATCH_ALL_DONE\r\n");
+            CDC_TX_Kick();
 
             dc_motors_stop_all();
             t0_batch_active = 0U;
@@ -3958,21 +4250,96 @@ static uint8_t divergence_capture_both_axes_at_z(uint32_t step_index)
     return (axis0_ok || axis1_ok) ? 1U : 0U;
 }
 
+static uint8_t m2_capture_both_axes_at_z(uint32_t step_index)
+{
+    uint8_t axis0_ok = 0U;
+    uint8_t axis1_ok = 0U;
+
+    printf("M2_POS_BEGIN,z_mm=%.3f,step=%lu\r\n",
+           z_current_mm,
+           (unsigned long)step_index);
+
+    printf("M2_AXIS_BEGIN,z_mm=%.3f,step=%lu,axis=0\r\n",
+           z_current_mm,
+           (unsigned long)step_index);
+
+    profile_find_t0_only(PROFILE_AXIS_M1);
+
+    if (!host_local_t0_ready)
+    {
+        printf("M2_AXIS_FAIL,z_mm=%.3f,step=%lu,axis=0\r\n",
+               z_current_mm,
+               (unsigned long)step_index);
+    }
+    else
+    {
+        axis0_ok = 1U;
+        printf("M2_AXIS_DONE,z_mm=%.3f,step=%lu,axis=0,"
+               "idx=%lu,t0_enc=%ld,x0_counts=%ld,t0_ms=%.6f\r\n",
+               z_current_mm,
+               (unsigned long)step_index,
+               (unsigned long)profiler.t0_idx,
+               (long)profiler.t0_enc_count,
+               (long)profiler.x0_counts,
+               profiler.t0_s * 1000.0f);
+    }
+
+    HAL_Delay(Z_SETTLE_MS);
+
+    printf("M2_AXIS_BEGIN,z_mm=%.3f,step=%lu,axis=1\r\n",
+           z_current_mm,
+           (unsigned long)step_index);
+
+    profile_find_t0_only(PROFILE_AXIS_M2);
+
+    if (!host_local_t0_ready)
+    {
+        printf("M2_AXIS_FAIL,z_mm=%.3f,step=%lu,axis=1\r\n",
+               z_current_mm,
+               (unsigned long)step_index);
+    }
+    else
+    {
+        axis1_ok = 1U;
+        printf("M2_AXIS_DONE,z_mm=%.3f,step=%lu,axis=1,"
+               "idx=%lu,t0_enc=%ld,x0_counts=%ld,t0_ms=%.6f\r\n",
+               z_current_mm,
+               (unsigned long)step_index,
+               (unsigned long)profiler.t0_idx,
+               (long)profiler.t0_enc_count,
+               (long)profiler.x0_counts,
+               profiler.t0_s * 1000.0f);
+    }
+
+    printf("M2_POS_DONE,z_mm=%.3f,step=%lu,axis0_ok=%u,axis1_ok=%u\r\n",
+           z_current_mm,
+           (unsigned long)step_index,
+           (unsigned int)axis0_ok,
+           (unsigned int)axis1_ok);
+
+    return (axis0_ok || axis1_ok) ? 1U : 0U;
+}
+
 static void t0_emit_raw_scan(ProfileAxis_t axis)
 {
-    // Reset dump state so t0_dump_scan_step starts fresh.
     t0_dump_started = 0U;
     t0_dump_idx     = 0U;
 
-    // Drive the same non-blocking dump function used by t0_batch_update()
-    // to completion, yielding to live_power_update_service() between each
-    // 16-line burst so the USB CDC TX buffer never overflows.
     while (!t0_dump_scan_step(axis, 0U))
     {
         live_power_update_service();
 
-        // Also keep motor regulation alive during the dump in case
-        // clear_active_axis_out_of_beam() needs a stable speed reading.
+        // Block here until ring has at least 1KB free
+        // before attempting the next 8-line burst
+        uint32_t wait_start = HAL_GetTick();
+        while (CDC_TX_Count() > (65536U - 1024U))
+        {
+            CDC_TX_Kick();
+            live_power_update_service();
+            if ((HAL_GetTick() - wait_start) > 500U)
+                break;
+        }
+
         uint32_t now = HAL_GetTick();
         if ((now - last_dc_speed_ms) >= DC_SPEED_SAMPLE_MS)
         {
@@ -3984,8 +4351,6 @@ static void t0_emit_raw_scan(ProfileAxis_t axis)
         }
     }
 
-    // One final service call after the last burst to flush the
-    // RAW_SCAN_DONE line before the caller prints T0_RESULT.
     live_power_update_service();
 }
 
@@ -4589,14 +4954,7 @@ static uint8_t m2_fit_d4sigma_curve(const float *z_mm,
 
 static uint8_t run_m2_measurement(float step_mm, float total_mm)
 {
-    static float coarse_targets_mm[M2_MAX_POSITIONS];
-    static float coarse_z_mm[2][M2_MAX_POSITIONS];
-    static float coarse_d4sigma_mm[2][M2_MAX_POSITIONS];
-    static float iso_targets_mm[M2_ISO_TARGET_POINTS];
-    static float iso_z_mm[2][M2_ISO_TARGET_POINTS];
-    static float iso_d4sigma_mm[2][M2_ISO_TARGET_POINTS];
-    uint32_t coarse_target_count = 0U;
-    uint32_t iso_target_count = 0U;
+    uint32_t n_positions;
 
     if (step_mm <= 0.0f || total_mm <= 0.0f)
     {
@@ -4604,167 +4962,44 @@ static uint8_t run_m2_measurement(float step_mm, float total_mm)
         return 0U;
     }
 
-    coarse_targets_mm[coarse_target_count++] = 0.0f;
-    for (float z_mm = step_mm; z_mm <= (total_mm + 0.001f); z_mm += step_mm)
-    {
-        if (coarse_target_count >= M2_MAX_POSITIONS)
-            break;
-        coarse_targets_mm[coarse_target_count++] = z_mm;
-    }
-
-    if ((coarse_target_count == 0U) || (coarse_target_count > M2_MAX_POSITIONS))
+    n_positions = (uint32_t)(total_mm / step_mm + 0.5f);
+    if ((n_positions == 0U) || (n_positions > M2_MAX_POSITIONS))
     {
         printf("M2_BAD_ARGS,positions=%lu,max=%u\r\n",
-               (unsigned long)coarse_target_count,
+               (unsigned long)n_positions,
                (unsigned int)M2_MAX_POSITIONS);
         return 0U;
     }
 
     divergence_busy = 1U;
 
-    printf("M2_BEGIN,step_mm=%.3f,total_mm=%.3f,coarse_points=%lu,lambda_nm=%.3f\r\n",
+    printf("M2_BEGIN,step_mm=%.3f,total_mm=%.3f,positions=%lu\r\n",
            step_mm,
            total_mm,
-           (unsigned long)coarse_target_count,
-           M2_WAVELENGTH_NM);
+           (unsigned long)n_positions);
 
-    for (uint32_t axis = 0U; axis < 2U; axis++)
+    z_home_simple(Z_HOME_DIR);
+    if (!home_pressed())
     {
-        uint32_t coarse_valid_count = 0U;
-        uint32_t iso_valid_count = 0U;
-        float z0_mm;
-        float d0_mm;
-        float theta_rad;
-        float m2;
-        float z_rayleigh_mm;
-        uint32_t inside_count;
-        uint32_t outside_count;
+        printf("M2_HOME_FAIL\r\n");
+        divergence_busy = 0U;
+        return 0U;
+    }
 
-        if (!m2_measure_axis_at_positions((ProfileAxis_t)axis,
-                                          coarse_targets_mm,
-                                          coarse_target_count,
-                                          coarse_z_mm[axis],
-                                          coarse_d4sigma_mm[axis],
-                                          &coarse_valid_count,
-                                          "ROUGH"))
+    HAL_Delay(Z_SETTLE_MS);
+
+    for (uint32_t i = 0U; i < n_positions; i++)
+    {
+        z_move_mm_dir(Z_AWAY_DIR, step_mm);
+        HAL_Delay(Z_SETTLE_MS);
+
+        if (!m2_capture_both_axes_at_z(i + 1U))
         {
-            printf("M2_ROUGH_FAIL,axis=%u,points=%lu\r\n",
-                   (unsigned int)axis,
-                   (unsigned long)coarse_valid_count);
-            continue;
-        }
-
-        if (!m2_fit_d4sigma_curve(coarse_z_mm[axis],
-                                  coarse_d4sigma_mm[axis],
-                                  coarse_valid_count,
-                                  M2_WAVELENGTH_NM,
-                                  &z0_mm,
-                                  &d0_mm,
-                                  &theta_rad,
-                                  &m2,
-                                  &z_rayleigh_mm))
-        {
-            printf("M2_ROUGH_FIT_FAIL,axis=%u,points=%lu\r\n",
-                   (unsigned int)axis,
-                   (unsigned long)coarse_valid_count);
-            continue;
-        }
-
-        printf("M2_ROUGH_FIT,axis=%u,points=%lu,z0_mm=%.6f,d0_mm=%.6f,zR_mm=%.6f,theta_rad=%.9f,m2=%.6f\r\n",
-               (unsigned int)axis,
-               (unsigned long)coarse_valid_count,
-               z0_mm,
-               d0_mm,
-               z_rayleigh_mm,
-               theta_rad,
-               m2);
-
-        if (!m2_build_iso_positions(z0_mm,
-                                    z_rayleigh_mm,
-                                    total_mm,
-                                    iso_targets_mm,
-                                    &iso_target_count))
-        {
-            printf("M2_ISO_PLAN_FAIL,axis=%u,z0_mm=%.6f,zR_mm=%.6f,total_mm=%.3f\r\n",
-                   (unsigned int)axis,
-                   z0_mm,
-                   z_rayleigh_mm,
-                   total_mm);
-            continue;
-        }
-
-        for (uint32_t i = 0U; i < iso_target_count; i++)
-        {
-            printf("M2_ISO_TARGET,axis=%u,index=%lu,z_mm=%.3f\r\n",
-                   (unsigned int)axis,
-                   (unsigned long)(i + 1U),
-                   iso_targets_mm[i]);
-        }
-
-        if (!m2_measure_axis_at_positions((ProfileAxis_t)axis,
-                                          iso_targets_mm,
-                                          iso_target_count,
-                                          iso_z_mm[axis],
-                                          iso_d4sigma_mm[axis],
-                                          &iso_valid_count,
-                                          "ISO"))
-        {
-            printf("M2_ISO_FAIL,axis=%u,reason=insufficient_points,points=%lu\r\n",
-                   (unsigned int)axis,
-                   (unsigned long)iso_valid_count);
-            continue;
-        }
-
-        if (!m2_fit_d4sigma_curve(iso_z_mm[axis],
-                                  iso_d4sigma_mm[axis],
-                                  iso_valid_count,
-                                  M2_WAVELENGTH_NM,
-                                  &z0_mm,
-                                  &d0_mm,
-                                  &theta_rad,
-                                  &m2,
-                                  &z_rayleigh_mm))
-        {
-            printf("M2_ISO_FIT_FAIL,axis=%u,points=%lu\r\n",
-                   (unsigned int)axis,
-                   (unsigned long)iso_valid_count);
-            continue;
-        }
-
-        inside_count = m2_count_points_within_radius(iso_z_mm[axis],
-                                                     iso_valid_count,
-                                                     z0_mm,
-                                                     z_rayleigh_mm);
-        outside_count = m2_count_points_outside_radius(iso_z_mm[axis],
-                                                       iso_valid_count,
-                                                       z0_mm,
-                                                       2.0f * z_rayleigh_mm);
-
-        printf("M2_FIT,axis=%u,points=%lu,z0_mm=%.6f,d0_mm=%.6f,zR_mm=%.6f,theta_rad=%.9f,m2=%.6f\r\n",
-               (unsigned int)axis,
-               (unsigned long)iso_valid_count,
-               z0_mm,
-               d0_mm,
-               z_rayleigh_mm,
-               theta_rad,
-               m2);
-
-        if ((inside_count >= M2_ISO_POINTS_INSIDE) &&
-            (outside_count >= M2_ISO_POINTS_OUTSIDE))
-        {
-            printf("M2_ISO_PASS,axis=%u,inside_zR=%lu,outside_2zR=%lu\r\n",
-                   (unsigned int)axis,
-                   (unsigned long)inside_count,
-                   (unsigned long)outside_count);
-        }
-        else
-        {
-            printf("M2_ISO_FAIL,axis=%u,inside_zR=%lu,outside_2zR=%lu,required_inside=%u,required_outside=%u\r\n",
-                   (unsigned int)axis,
-                   (unsigned long)inside_count,
-                   (unsigned long)outside_count,
-                   (unsigned int)M2_ISO_POINTS_INSIDE,
-                   (unsigned int)M2_ISO_POINTS_OUTSIDE);
+            printf("M2_ABORT,z_mm=%.3f,step=%lu\r\n",
+                   z_current_mm,
+                   (unsigned long)(i + 1U));
+            divergence_busy = 0U;
+            return 0U;
         }
     }
 
@@ -4772,6 +5007,39 @@ static uint8_t run_m2_measurement(float step_mm, float total_mm)
 
     divergence_busy = 0U;
     return 1U;
+}
+
+static uint8_t run_m2_capture_at_position(float target_mm, uint32_t step_index)
+{
+    uint8_t ok;
+
+    if ((target_mm < 0.0f) || (target_mm > M2_TOTAL_MM))
+    {
+        printf("M2_POS_BAD_ARGS,target_z_mm=%.3f,max_z_mm=%.3f\r\n",
+               target_mm,
+               M2_TOTAL_MM);
+        return 0U;
+    }
+
+    divergence_busy = 1U;
+
+    printf("M2_TARGET_BEGIN,target_z_mm=%.3f,step=%lu\r\n",
+           target_mm,
+           (unsigned long)step_index);
+
+    z_move_to_mm(target_mm);
+    HAL_Delay(Z_SETTLE_MS);
+
+    ok = m2_capture_both_axes_at_z(step_index);
+
+    printf("M2_TARGET_DONE,target_z_mm=%.3f,actual_z_mm=%.3f,step=%lu,ok=%u\r\n",
+           target_mm,
+           z_current_mm,
+           (unsigned long)step_index,
+           (unsigned int)ok);
+
+    divergence_busy = 0U;
+    return ok;
 }
 
 static float z_plot_mm(void)
@@ -5049,6 +5317,8 @@ static uint8_t run_step_divergence(float step_mm, uint32_t num_positions)
 //    return 1U;
 //}
 
+
+// WORKING DIVERGENCE
 static uint8_t run_divergence_measurement(float step_mm, float total_mm)
 {
     uint32_t n_positions;
@@ -5090,8 +5360,8 @@ static uint8_t run_divergence_measurement(float step_mm, float total_mm)
         HAL_Delay(Z_SETTLE_MS);
 
         // Start t0_batch for both axes
-        t0_batch_begin(PROFILE_AXIS_M1, 10U);
         t0_batch_total_axes = 2U;   // scan M1 then auto-switch to M2
+        t0_batch_begin(PROFILE_AXIS_M1, 10U);
 
         // Run t0_batch state machine until complete
         while (t0_batch_active)
@@ -5099,6 +5369,8 @@ static uint8_t run_divergence_measurement(float step_mm, float total_mm)
             t0_batch_update();
             live_power_update_service();
         }
+
+        HAL_Delay(100);
 
         printf("DIV_POS_DONE,z_mm=%.3f,step=%lu\r\n",
                z_plot_mm(), (unsigned long)(i + 1U));
@@ -5116,6 +5388,111 @@ static uint8_t run_divergence_measurement(float step_mm, float total_mm)
     divergence_busy = 0U;
     return 1U;
 }
+
+//static uint8_t run_divergence_measurement(float step_mm, float total_mm)
+//{
+//    uint32_t n_positions;
+//    uint32_t steps_per_position;
+//    uint32_t initial_steps;
+//    float actual_step_mm;
+//    float actual_total_mm;
+//
+//    if (step_mm <= 0.0f || total_mm <= 0.0f)
+//    {
+//        printf("DIVERGENCE_BAD_ARGS\r\n");
+//        return 0U;
+//    }
+//
+//    steps_per_position = (uint32_t)(step_mm * Z_STEPS_PER_MM + 0.5f);
+//    initial_steps      = (uint32_t)(total_mm * Z_STEPS_PER_MM + 0.5f);
+//
+//    if (steps_per_position == 0U || initial_steps == 0U)
+//    {
+//        printf("DIVERGENCE_BAD_STEPS\r\n");
+//        return 0U;
+//    }
+//
+//    actual_step_mm  = ((float)steps_per_position) / Z_STEPS_PER_MM;
+//    actual_total_mm = ((float)initial_steps) / Z_STEPS_PER_MM;
+//
+//    // Exactly 10 scan positions:
+//    // 270, 260, 250, ... 180
+//    n_positions = 10U;
+//
+//    divergence_busy = 1U;
+//
+//    printf("DIVERGENCE_BEGIN,step_mm=%.3f,total_mm=%.3f,positions=%lu\r\n",
+//           actual_step_mm, actual_total_mm, (unsigned long)n_positions);
+//
+//    // -------------------------------------------------
+//    // 1) Home
+//    // -------------------------------------------------
+//    z_home_simple(Z_HOME_DIR);
+//    z_current_mm = 0.0f;
+//    printf("ZHOME_DONE,z_mm=%.3f\r\n", z_plot_mm());
+//
+//    // -------------------------------------------------
+//    // 2) Move to 270 mm away from home
+//    // -------------------------------------------------
+//    z_stepper_wake();
+//    HAL_Delay(5);
+//    z_set_dir(Z_AWAY_DIR);
+//    HAL_Delay(5);
+//
+//    z_move_steps(initial_steps);
+//    z_current_mm = actual_total_mm;
+//
+//    printf("Z_INITIAL_MOVE_DONE,z_mm=%.3f\r\n", z_plot_mm());
+//    HAL_Delay(Z_SETTLE_MS);
+//
+//    // -------------------------------------------------
+//    // 3) Scan 10 positions total
+//    // -------------------------------------------------
+//    for (uint32_t i = 0U; i < n_positions; i++)
+//    {
+//        printf("DIV_POS_BEGIN,index=%lu,z_mm=%.3f\r\n",
+//               (unsigned long)i, z_plot_mm());
+//
+//        t0_batch_total_axes = 2U;
+//        t0_batch_begin(PROFILE_AXIS_M1, 10U);
+//
+//        while (t0_batch_active)
+//        {
+//            t0_batch_update();
+//            live_power_update_service();
+//        }
+//
+//        printf("DIV_POS_DONE,index=%lu,z_mm=%.3f\r\n",
+//               (unsigned long)i, z_plot_mm());
+//
+//        // Move back 10 mm after every scan except the last one
+//        if (i < (n_positions - 1U))
+//        {
+//            z_stepper_wake();
+//            HAL_Delay(5);
+//            z_set_dir(Z_HOME_DIR);
+//            HAL_Delay(5);
+//
+//            z_move_steps(steps_per_position);
+//
+//            if (z_current_mm >= actual_step_mm)
+//                z_current_mm -= actual_step_mm;
+//            else
+//                z_current_mm = 0.0f;
+//
+//            printf("Z_STEP_BACK_DONE,index=%lu,z_mm=%.3f\r\n",
+//                   (unsigned long)(i + 1U), z_plot_mm());
+//
+//            HAL_Delay(Z_SETTLE_MS);
+//        }
+//    }
+//
+//    printf("DIVERGENCE_DONE,final_z_mm=%.3f\r\n", z_plot_mm());
+//
+//    z_stepper_disable();
+//    divergence_busy = 0U;
+//    return 1U;
+//}
 
 //static uint8_t run_divergence_measurement(float step_mm, float total_mm)
 //{
@@ -5520,39 +5897,40 @@ static void beam_profile_start_window_counts(int32_t window_counts)
 //    profile_raw_count++;
 //}
 
-static void beam_profile_sample_position_window(void)
-{
-    uint32_t wr = adc_dma_write_index();
+//static void beam_profile_sample_position_window(void)
+//{
+//    uint32_t wr = adc_dma_write_index();
+//
+//    while (profile_last_adc_idx != wr)
+//    {
+//        uint16_t raw = adc_buf[profile_last_adc_idx];
+//        uint8_t keep_sample = 0U;
+//
+//        if ((profile_capture_stride_counter % PROFILE_CAPTURE_STORE_STRIDE) == 0U)
+//            keep_sample = 1U;
+//        profile_capture_stride_counter++;
+//
+//        if (keep_sample)
+//        {
+//            if (profile_raw_count >= PROFILE_CAPTURE_MAX_SAMPLES)
+//                break;
+//
+//            profile_raw_power_buf[profile_raw_count] = raw;
+//            profile_raw_enc_buf[profile_raw_count]   = enc_read_axis_count(profiler.axis);
+//            profile_raw_stage_buf[profile_raw_count] = (uint8_t)current_gain;
+//            profile_raw_count++;
+//        }
+//
+//        profile_last_adc_idx++;
+//        if (profile_last_adc_idx >= ADC_BUF_LEN)
+//            profile_last_adc_idx = 0U;
+//    }
+//
+//    profiler.scan_end_enc_count = enc_read_axis_count(profiler.axis);
+//}
 
-    while (profile_last_adc_idx != wr)
-    {
-        uint16_t raw = adc_buf[profile_last_adc_idx];
-        uint8_t keep_sample = 0U;
 
-        if ((profile_capture_stride_counter % PROFILE_CAPTURE_STORE_STRIDE) == 0U)
-            keep_sample = 1U;
-        profile_capture_stride_counter++;
-
-        if (keep_sample)
-        {
-            if (profile_raw_count >= PROFILE_CAPTURE_MAX_SAMPLES)
-                break;
-
-            profile_raw_power_buf[profile_raw_count] = raw;
-            profile_raw_enc_buf[profile_raw_count]   = enc_read_axis_count(profiler.axis);
-            profile_raw_stage_buf[profile_raw_count] = (uint8_t)current_gain;
-            profile_raw_count++;
-        }
-
-        profile_last_adc_idx++;
-        if (profile_last_adc_idx >= ADC_BUF_LEN)
-            profile_last_adc_idx = 0U;
-    }
-
-    profiler.scan_end_enc_count = enc_read_axis_count(profiler.axis);
-}
-
-// Scan done check by encoder counts
+//// Scan done check by encoder counts
 static uint8_t beam_profile_window_done_counts(void)
 {
     int32_t enc_now = enc_read_axis_count(profiler.axis);
@@ -5568,6 +5946,52 @@ static uint8_t beam_profile_window_done_counts(void)
         return 1U;
     }
     return 0U;
+}
+
+static void beam_profile_sample_position_window(void)
+{
+    uint32_t wr = adc_dma_write_index();
+    int32_t dir = profile_get_active_count_direction();
+
+    while (profile_last_adc_idx != wr)
+    {
+        int32_t enc_now = enc_read_axis_count(profiler.axis);
+        int32_t remaining = enc_delta_counts(profiler.scan_stop_enc_target, enc_now);
+
+        if (dir < 0)
+            remaining = -remaining;
+
+        // Stop immediately once the encoder window is complete.
+        if (remaining <= 0)
+        {
+            profiler.scan_end_enc_count = enc_now;
+            break;
+        }
+
+        uint16_t raw = adc_buf[profile_last_adc_idx];
+        uint8_t keep_sample = 0U;
+
+        if ((profile_capture_stride_counter % PROFILE_CAPTURE_STORE_STRIDE) == 0U)
+            keep_sample = 1U;
+        profile_capture_stride_counter++;
+
+        if (keep_sample)
+        {
+            if (profile_raw_count >= PROFILE_CAPTURE_MAX_SAMPLES)
+                break;
+
+            profile_raw_power_buf[profile_raw_count] = raw;
+            profile_raw_enc_buf[profile_raw_count]   = enc_now;
+            profile_raw_stage_buf[profile_raw_count] = (uint8_t)current_gain;
+            profile_raw_count++;
+        }
+
+        profile_last_adc_idx++;
+        if (profile_last_adc_idx >= ADC_BUF_LEN)
+            profile_last_adc_idx = 0U;
+    }
+
+    profiler.scan_end_enc_count = enc_read_axis_count(profiler.axis);
 }
 
 // -----------------------------
@@ -7280,326 +7704,407 @@ static void fft_process_chunk(const uint16_t *src, uint32_t n)
 //    fft_chunks_processed++;
 }
 
-static void do_wavelength_fft_measurement(void)
+// DMA WINDOW HELPER FOR WAVELENGTH
+static void wl_process_dma_for_window(uint32_t window_id,
+                                      uint32_t *chunk_id,
+                                      uint32_t *samples_this_window)
 {
-    uint32_t avg;
-    uint32_t valid        = 0U;
-    float    f_sum        = 0.0f;
-    float    f_avg_single = 0.0f;
-    float    f_avg_spec   = 0.0f;
-    float    lambda_nm    = 0.0f;
+    uint32_t remaining;
+    uint32_t n_send;
 
-    float    pos_mm       = 0.0f;
-    uint8_t  dir          = 1U;
-
-    const float    mm_per_step   = 1.0f / STEP3_STEPS_PER_MM;
-    const uint32_t step_us       = STEP3_STEP_PERIOD_US;
-    const uint32_t steps_per_leg = (uint32_t)(WL_LIMIT_MM * STEP3_STEPS_PER_MM + 0.5f);
-    const float    v_mm_s        = STEP3_SPEED_MM_S;
-
-    fft_busy            = 1U;
-    fft_abort_flag      = 0U;
-    fft_chunks_processed = 0U;
-
-    // Clear accumulator once at the very start — shared across all runs
-    for (uint32_t k = 0U; k < (FFT_SAMPLES / 2U); k++)
-        fft_mag_accum[k] = 0.0f;
-
-    if (arm_rfft_fast_init_f32(&fft_inst, FFT_SAMPLES) != ARM_MATH_SUCCESS)
-    {
-        printf("FFT_ERR,init\r\n");
-        fft_busy = 0U;
+    if (chunk_id == NULL || samples_this_window == NULL)
         return;
+
+    if (*samples_this_window >= WL_WINDOW_SAMPLES)
+        return;
+
+    if (fft_chunk_half_ready)
+    {
+        fft_chunk_half_ready = 0U;
+
+        remaining = WL_WINDOW_SAMPLES - *samples_this_window;
+        n_send = (remaining >= FFT_CHUNK_HALF) ? FFT_CHUNK_HALF : remaining;
+
+        wl_send_raw_packet(window_id, *chunk_id, &fft_chunk_buf[0], n_send);
+
+        (*chunk_id)++;
+        *samples_this_window += n_send;
     }
 
-    printf("FFT_BEGIN,fs=%.1f,chunk=%lu,runs=%u,"
-           "step_us=%lu,steps_per_mm=%.3f,speed_mm_s=%.3f,"
-           "limit_mm=%.1f,steps_per_leg=%lu\r\n",
-           FFT_ADC_FS_HZ,
-           (unsigned long)FFT_CHUNK_SIZE,
-           (unsigned int)WL_NUM_RUNS,
-           (unsigned long)step_us,
-           STEP3_STEPS_PER_MM,
-           STEP3_SPEED_MM_S,
-           WL_LIMIT_MM,
-           (unsigned long)steps_per_leg);
+    if (*samples_this_window >= WL_WINDOW_SAMPLES)
+        return;
 
-    stepper3_sleep_wake();
-    HAL_Delay(2);
-    drv3_set_dir(dir);
-    HAL_Delay(1);
-
-    for (avg = 0U; avg < WL_NUM_RUNS; avg++)
+    if (fft_chunk_full_ready)
     {
-        uint32_t steps_taken     = 0U;
-        uint32_t chunks_this_run = 0U;
-        float    f_peak_this_run = 0.0f;
-        float    lambda_this_run = 0.0f;
+        fft_chunk_full_ready = 0U;
 
-        if (fft_abort_flag)
-            break;
+        remaining = WL_WINDOW_SAMPLES - *samples_this_window;
+        n_send = (remaining >= FFT_CHUNK_HALF) ? FFT_CHUNK_HALF : remaining;
 
-        uint32_t steps_to_wall;
-        if (dir == 1U)
-            steps_to_wall = (uint32_t)((WL_LIMIT_MM - pos_mm)
-                                       * STEP3_STEPS_PER_MM + 0.5f);
-        else
-            steps_to_wall = (uint32_t)(pos_mm * STEP3_STEPS_PER_MM + 0.5f);
+        wl_send_raw_packet(window_id, *chunk_id, &fft_chunk_buf[FFT_CHUNK_HALF], n_send);
 
-        if (steps_to_wall == 0U)
-        {
-            dir ^= 1U;
-            drv3_set_dir(dir);
-            HAL_Delay(1);
-            steps_to_wall = steps_per_leg;
-        }
+        (*chunk_id)++;
+        *samples_this_window += n_send;
+    }
+}
 
-        printf("FFT_RUN_BEGIN,run=%lu,dir=%u,pos_mm=%.3f,"
-               "steps_to_wall=%lu\r\n",
-               (unsigned long)(avg + 1U),
-               (unsigned int)dir,
-               pos_mm,
-               (unsigned long)steps_to_wall);
 
-        // ----------------------------------------------------------
-        // Start circular DMA on chunk buffer
-        // Half/full callbacks fire every FFT_CHUNK_HALF samples
-        // ----------------------------------------------------------
+//// OLD Wavelength process
+//static void do_wavelength_fft_measurement(void)
+//{
+//    uint8_t dir = 1U;
+//    float pos_mm = 0.0f;
+//
+//    uint32_t window_id = 0U;
+//
+//    const uint32_t step_period_us = step3_step_period_us();
+//    const uint32_t steps_to_wall_total =
+//        (uint32_t)(WL_LIMIT_MM * STEP3_STEPS_PER_MM + 0.5f);
+//
+//    fft_busy = 1U;
+//    fft_abort_flag = 0U;
+//
+//    printf("WL_RAW_BEGIN,fs_hz=%.1f,window_samples=%lu,window_s=%.6f,"
+//           "speed_mm_s=%.3f,limit_mm=%.3f\r\n",
+//           FFT_ADC_FS_HZ,
+//           (unsigned long)WL_WINDOW_SAMPLES,
+//           WL_WINDOW_TIME_S,
+//           STEP3_SPEED_MM_S,
+//           WL_LIMIT_MM);
+//
+//    stepper_sleep_wake();
+//    HAL_Delay(10);
+//
+//    for (uint32_t leg = 0U; leg < WL_NUM_RUNS; leg++)
+//    {
+//        uint32_t steps_taken = 0U;
+//
+//        drv2_set_dir(dir);
+//        HAL_Delay(10);
+//
+//        printf("WL_LEG_BEGIN,leg=%lu,dir=%u,pos_mm=%.3f\r\n",
+//               (unsigned long)(leg + 1U),
+//               (unsigned int)dir,
+//               pos_mm);
+//
+//        while (steps_taken < steps_to_wall_total)
+//        {
+//            float distance_to_wall_mm;
+//            float time_to_wall_s;
+//
+//            if (fft_abort_flag)
+//                goto wl_done;
+//
+//            if (dir)
+//                distance_to_wall_mm = WL_LIMIT_MM - pos_mm;
+//            else
+//                distance_to_wall_mm = pos_mm;
+//
+//            if (distance_to_wall_mm < 0.0f)
+//                distance_to_wall_mm = 0.0f;
+//
+//            time_to_wall_s = distance_to_wall_mm / STEP3_SPEED_MM_S;
+//
+//            /*
+//             * Do NOT start a new 0.3 s capture if it would run into the wall.
+//             */
+//            if (time_to_wall_s < WL_WALL_GUARD_S)
+//            {
+//                printf("WL_NEAR_WALL_SKIP_WINDOW,leg=%lu,dir=%u,pos_mm=%.3f,"
+//                       "time_to_wall_s=%.6f\r\n",
+//                       (unsigned long)(leg + 1U),
+//                       (unsigned int)dir,
+//                       pos_mm,
+//                       time_to_wall_s);
+//                break;
+//            }
+//
+//            /*
+//             * Capture one exact 60000-sample window.
+//             */
+//            uint32_t chunk_id = 0U;
+//            uint32_t samples_this_window = 0U;
+//
+//            fft_chunk_half_ready = 0U;
+//            fft_chunk_full_ready = 0U;
+//
+//            printf("WL_WINDOW_BEGIN,window=%lu,leg=%lu,dir=%u,pos_mm=%.3f,"
+//                   "target_samples=%lu\r\n",
+//                   (unsigned long)window_id,
+//                   (unsigned long)(leg + 1U),
+//                   (unsigned int)dir,
+//                   pos_mm,
+//                   (unsigned long)WL_WINDOW_SAMPLES);
+//
+//            if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)fft_chunk_buf, FFT_CHUNK_SIZE) != HAL_OK)
+//            {
+//                printf("WL_ERR,adc_start_failed\r\n");
+//                goto wl_done;
+//            }
+//
+//            if (HAL_TIM_Base_Start(&htim6) != HAL_OK)
+//            {
+//                printf("WL_ERR,tim6_start_failed\r\n");
+//                HAL_ADC_Stop_DMA(&hadc1);
+//                goto wl_done;
+//            }
+//
+//            uint32_t scan_start_ms = HAL_GetTick();
+//
+//            while (samples_this_window < WL_WINDOW_SAMPLES)
+//            {
+//                /*
+//                 * Step continuously during the ADC scan window.
+//                 * At 5 mm/s and 100 kHz, 60000 samples should take 0.6 s,
+//                 * so this should move about 3 mm per scan window.
+//                 */
+//                step2_pulse();
+//                delay_us(step_period_us);
+//
+//                steps_taken++;
+//
+//                if (dir)
+//                    pos_mm += (1.0f / STEP3_STEPS_PER_MM);
+//                else
+//                    pos_mm -= (1.0f / STEP3_STEPS_PER_MM);
+//
+//                if (pos_mm < 0.0f)
+//                    pos_mm = 0.0f;
+//                if (pos_mm > WL_LIMIT_MM)
+//                    pos_mm = WL_LIMIT_MM;
+//
+//                wl_process_dma_for_window(window_id, &chunk_id, &samples_this_window);
+//                CDC_TX_Kick();
+//
+//                /*
+//                 * Safety only: if we somehow reach the wall during a scan,
+//                 * stop stepping but continue servicing DMA until 60000 samples.
+//                 */
+//                if (steps_taken >= steps_to_wall_total)
+//                {
+//                    uint32_t wait_start_ms = HAL_GetTick();
+//
+//                    printf("WL_HIT_WALL_DURING_WINDOW,window=%lu,samples=%lu,chunks=%lu,pos_mm=%.3f\r\n",
+//                           (unsigned long)window_id,
+//                           (unsigned long)samples_this_window,
+//                           (unsigned long)chunk_id,
+//                           pos_mm);
+//
+//                    while (samples_this_window < WL_WINDOW_SAMPLES)
+//                    {
+//                        wl_process_dma_for_window(window_id, &chunk_id, &samples_this_window);
+//                        CDC_TX_Kick();
+//
+//                        if ((HAL_GetTick() - wait_start_ms) > 1500U)
+//                        {
+//                            printf("WL_SAMPLE_TIMEOUT,window=%lu,samples=%lu,chunks=%lu,pos_mm=%.3f\r\n",
+//                                   (unsigned long)window_id,
+//                                   (unsigned long)samples_this_window,
+//                                   (unsigned long)chunk_id,
+//                                   pos_mm);
+//                            break;
+//                        }
+//                    }
+//
+//                    break;
+//                }
+//
+//                if ((HAL_GetTick() - scan_start_ms) > 1500U)
+//                {
+//                    printf("WL_WINDOW_TIMEOUT,window=%lu,samples=%lu,chunks=%lu,pos_mm=%.3f\r\n",
+//                           (unsigned long)window_id,
+//                           (unsigned long)samples_this_window,
+//                           (unsigned long)chunk_id,
+//                           pos_mm);
+//                    break;
+//                }
+//            }
+//
+//            HAL_TIM_Base_Stop(&htim6);
+//            HAL_ADC_Stop_DMA(&hadc1);
+//
+//            /*
+//             * Catch any final DMA flag after stopping.
+//             */
+//            wl_process_dma_for_window(window_id, &chunk_id, &samples_this_window);
+//
+//            printf("WL_WINDOW_END,window=%lu,samples=%lu,chunks=%lu,pos_mm=%.3f\r\n",
+//                   (unsigned long)window_id,
+//                   (unsigned long)samples_this_window,
+//                   (unsigned long)chunk_id,
+//                   pos_mm);
+//
+//            window_id++;
+//        }
+//
+//        /*
+//         * Move remaining distance to the wall without ADC sampling.
+//         */
+//        while (steps_taken < steps_to_wall_total)
+//        {
+//            step2_pulse();
+//            delay_us(step_period_us);
+//
+//            steps_taken++;
+//
+//            if (dir)
+//                pos_mm += (1.0f / STEP3_STEPS_PER_MM);
+//            else
+//                pos_mm -= (1.0f / STEP3_STEPS_PER_MM);
+//
+//            if (pos_mm < 0.0f)
+//                pos_mm = 0.0f;
+//            if (pos_mm > WL_LIMIT_MM)
+//                pos_mm = WL_LIMIT_MM;
+//        }
+//
+//        if (dir)
+//            pos_mm = WL_LIMIT_MM;
+//        else
+//            pos_mm = 0.0f;
+//
+//        printf("WL_WALL_HIT,leg=%lu,dir=%u,pos_mm=%.3f,total_windows=%lu\r\n",
+//               (unsigned long)(leg + 1U),
+//               (unsigned int)dir,
+//               pos_mm,
+//               (unsigned long)window_id);
+//
+//        /*
+//         * Pause here so USB can finish sending queued binary data.
+//         */
+//        CDC_TX_Kick();
+//        HAL_Delay(WL_USB_FLUSH_DELAY_MS);
+//
+//        dir ^= 1U;
+//        drv2_set_dir(dir);
+//        HAL_Delay(50);
+//
+//        printf("WL_DIRECTION_FLIP,leg=%lu,new_dir=%u,pos_mm=%.3f\r\n",
+//               (unsigned long)(leg + 1U),
+//               (unsigned int)dir,
+//               pos_mm);
+//
+//        HAL_Delay(50);
+//    }
+//
+//wl_done:
+//    HAL_TIM_Base_Stop(&htim6);
+//    HAL_ADC_Stop_DMA(&hadc1);
+//
+//    stepper_sleep_disable();
+//
+//    printf("WL_DONE,total_windows=%lu\r\n", (unsigned long)window_id);
+//    CDC_TX_Kick();
+//
+//    fft_busy = 0U;
+//}
+
+// NEW WAVELENGTH: ONE 0.6s scan back and forth 10 times
+static void do_wavelength_fft_measurement(void)
+{
+    uint32_t window_id = 0U;
+    const uint32_t step_period_us = step3_step_period_us();
+
+    fft_busy = 1U;
+    fft_abort_flag = 0U;
+
+    printf("WL_RAW_BEGIN,fs_hz=%.1f,window_samples=%lu,window_s=%.6f,"
+           "speed_mm_s=%.3f,runs=%lu\r\n",
+           FFT_ADC_FS_HZ,
+           (unsigned long)WL_WINDOW_SAMPLES,
+           WL_WINDOW_TIME_S,
+           STEP3_SPEED_MM_S,
+           (unsigned long)WL_NUM_RUNS);
+
+    stepper_sleep_wake();
+    HAL_Delay(10);
+
+    for (uint32_t run = 0U; run < WL_NUM_RUNS; run++)
+    {
+        uint32_t chunk_id = 0U;
+        uint32_t samples_this_window = 0U;
+        uint32_t steps_taken = 0U;
+        uint8_t dir = (run % 2U) ? 0U : 1U;
+
+        drv2_set_dir(dir);
+        HAL_Delay(10);
+
         fft_chunk_half_ready = 0U;
         fft_chunk_full_ready = 0U;
 
-        HAL_ADC_Stop_DMA(&hadc1);
-        HAL_TIM_Base_Stop(&htim6);
-        __HAL_TIM_SET_COUNTER(&htim6, 0U);
+        printf("WL_WINDOW_BEGIN,window=%lu,run=%lu,dir=%u,target_samples=%lu\r\n",
+               (unsigned long)window_id,
+               (unsigned long)(run + 1U),
+               (unsigned int)dir,
+               (unsigned long)WL_WINDOW_SAMPLES);
 
-        if (HAL_ADC_Start_DMA(&hadc1,
-                              (uint32_t *)fft_chunk_buf,
-                              FFT_CHUNK_SIZE) != HAL_OK)
+        if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)fft_chunk_buf, FFT_CHUNK_SIZE) != HAL_OK)
         {
-            printf("FFT_ERR,dma_start,run=%lu\r\n", (unsigned long)(avg + 1U));
-            break;
+            printf("WL_ERR,adc_start_failed\r\n");
+            goto wl_done;
         }
 
         if (HAL_TIM_Base_Start(&htim6) != HAL_OK)
         {
+            printf("WL_ERR,tim6_start_failed\r\n");
             HAL_ADC_Stop_DMA(&hadc1);
-            printf("FFT_ERR,tim_start,run=%lu\r\n", (unsigned long)(avg + 1U));
-            break;
+            goto wl_done;
         }
 
-        uint32_t t0_ms = HAL_GetTick();
+        uint32_t scan_start_ms = HAL_GetTick();
 
-        // ----------------------------------------------------------
-        // Step motor while processing chunks inside the step delay
-        // ----------------------------------------------------------
-        while (steps_taken < steps_to_wall)
+        while (samples_this_window < WL_WINDOW_SAMPLES)
         {
             if (fft_abort_flag)
-            {
-                HAL_TIM_Base_Stop(&htim6);
-                HAL_ADC_Stop_DMA(&hadc1);
-                goto fft_cleanup;
-            }
+                goto wl_done;
 
-            if ((HAL_GetTick() - t0_ms) > FFT_CAPTURE_TIMEOUT_MS)
-            {
-                HAL_TIM_Base_Stop(&htim6);
-                HAL_ADC_Stop_DMA(&hadc1);
-                printf("FFT_ERR,timeout,run=%lu,pos_mm=%.3f\r\n",
-                       (unsigned long)(avg + 1U), pos_mm);
-                goto fft_cleanup;
-            }
-
-            step_pulse();
+            step2_pulse();
+            delay_us(step_period_us);
             steps_taken++;
 
-            if (dir == 1U) pos_mm += mm_per_step;
-            else           pos_mm -= mm_per_step;
+            wl_process_dma_for_window(window_id, &chunk_id, &samples_this_window);
 
-            if (pos_mm < 0.0f)        pos_mm = 0.0f;
-            if (pos_mm > WL_LIMIT_MM) pos_mm = WL_LIMIT_MM;
-
-            // Use the 25ms step delay to process any waiting chunks
+            if ((HAL_GetTick() - scan_start_ms) > 1500U)
             {
-                uint32_t start = DWT->CYCCNT;
-                uint32_t ticks = step_us * (SystemCoreClock / 1000000U);
-
-                while ((DWT->CYCCNT - start) < ticks)
-                {
-                	if (fft_chunk_half_ready)
-                	{
-                	    fft_chunk_half_ready = 0U;
-
-                	    memcpy(fft_last_chunk_snap,
-                	           &fft_chunk_buf[0],
-                	           FFT_CHUNK_HALF * sizeof(uint16_t));
-
-                	    fft_process_chunk(fft_last_chunk_snap, FFT_CHUNK_HALF);
-
-                	    fft_chunks_processed++;   // ✅ REQUIRED
-                	    chunks_this_run++;        // ✅ for per-run tracking
-                	}
-
-                	if (fft_chunk_full_ready)
-                	{
-                	    fft_chunk_full_ready = 0U;
-
-                	    memcpy(fft_last_chunk_snap,
-                	           &fft_chunk_buf[FFT_CHUNK_HALF],
-                	           FFT_CHUNK_HALF * sizeof(uint16_t));
-
-                	    fft_process_chunk(fft_last_chunk_snap, FFT_CHUNK_HALF);
-
-                	    fft_chunks_processed++;   // ✅ REQUIRED
-                	    chunks_this_run++;        // ✅ for per-run tracking
-                	}
-                }
+                printf("WL_WINDOW_TIMEOUT,window=%lu,samples=%lu,chunks=%lu,steps=%lu\r\n",
+                       (unsigned long)window_id,
+                       (unsigned long)samples_this_window,
+                       (unsigned long)chunk_id,
+                       (unsigned long)steps_taken);
+                break;
             }
         }
 
-        // ----------------------------------------------------------
-        // Wall reached — stop ADC and timer
-        // ----------------------------------------------------------
         HAL_TIM_Base_Stop(&htim6);
         HAL_ADC_Stop_DMA(&hadc1);
 
-        pos_mm = (dir == 1U) ? WL_LIMIT_MM : 0.0f;
+        wl_process_dma_for_window(window_id, &chunk_id, &samples_this_window);
+        CDC_TX_Kick();
 
-        printf("FFT_WALL_HIT,run=%lu,dir=%u,pos_mm=%.3f,"
-               "steps=%lu,chunks=%lu,total_chunks=%lu\r\n",
-               (unsigned long)(avg + 1U),
-               (unsigned int)dir,
-               pos_mm,
+        printf("WL_WINDOW_END,window=%lu,samples=%lu,chunks=%lu,steps=%lu,dir=%u\r\n",
+               (unsigned long)window_id,
+               (unsigned long)samples_this_window,
+               (unsigned long)chunk_id,
                (unsigned long)steps_taken,
-               (unsigned long)chunks_this_run,
-               (unsigned long)fft_chunks_processed);
+               (unsigned int)dir);
 
-        // ----------------------------------------------------------
-        // Per-run peak from accumulated spectrum so far
-        // ----------------------------------------------------------
-        if (fft_chunks_processed > 0U)
-        {
-            f_peak_this_run = fft_find_avg_peak_hz_from_accum(
-                                  fft_chunks_processed, FFT_SAMPLES);
+        window_id++;
 
-            if (f_peak_this_run > 0.0f)
-            {
-                lambda_this_run = (2.0f * v_mm_s / f_peak_this_run) * 1.0e6f;
-                f_sum += f_peak_this_run;
-                valid++;
-
-                printf("FFT_RUN,avg=%lu,f_peak_hz=%.3f,lambda_nm=%.3f,"
-                       "v_mm_s=%.3f,steps=%lu,chunks=%lu,pos_mm=%.3f\r\n",
-                       (unsigned long)(avg + 1U),
-                       f_peak_this_run,
-                       lambda_this_run,
-                       v_mm_s,
-                       (unsigned long)steps_taken,
-                       (unsigned long)chunks_this_run,
-                       pos_mm);
-            }
-            else
-            {
-                printf("FFT_WARN,no_peak,avg=%lu\r\n", (unsigned long)(avg + 1U));
-            }
-        }
-
-        CDC_TX_Kick();
-
-        // ----------------------------------------------------------
-        // Send decimated snapshot of last chunk for time domain plot
-        // fft_last_chunk_snap holds the last processed half-chunk
-        // ----------------------------------------------------------
-        printf("WAVE_BEGIN,run=%lu,dir=%u,samples=%lu,"
-               "f_peak_hz=%.3f,lambda_nm=%.3f\r\n",
-               (unsigned long)(avg + 1U),
-               (unsigned int)dir,
-               (unsigned long)(FFT_CHUNK_HALF / 4U),
-               f_peak_this_run,
-               lambda_this_run);
-
-        for (uint32_t s = 0U; s < FFT_CHUNK_HALF; s += 4U)
-        {
-            printf("%u\r\n", (unsigned int)fft_last_chunk_snap[s]);
-            if ((s % 64U) == 0U) CDC_TX_Kick();
-        }
-
-        printf("WAVE_END,run=%lu\r\n", (unsigned long)(avg + 1U));
-        CDC_TX_Kick();
-
-        // ----------------------------------------------------------
-        // Flip direction
-        // ----------------------------------------------------------
-        dir ^= 1U;
-        drv3_set_dir(dir);
-        HAL_Delay(1);
-
-        printf("FFT_DIRECTION_FLIP,run=%lu,new_dir=%u,pos_mm=%.3f\r\n",
-               (unsigned long)(avg + 1U),
-               (unsigned int)dir,
-               pos_mm);
-        CDC_TX_Kick();
+        HAL_Delay(100);
     }
 
-fft_cleanup:
-    stepper3_sleep_disable();
+wl_done:
+    HAL_TIM_Base_Stop(&htim6);
+    HAL_ADC_Stop_DMA(&hadc1);
 
-    if (valid > 0U)
-    {
-        f_avg_single = f_sum / (float)valid;
-        f_avg_spec   = fft_find_avg_peak_hz_from_accum(
-                           fft_chunks_processed, FFT_SAMPLES);
-        lambda_nm    = (2.0f * v_mm_s / f_avg_spec) * 1.0e6f;
+    stepper_sleep_disable();
 
-        printf("SPECTRUM_BEGIN,n=%lu,fs=%.1f\r\n",
-               (unsigned long)(FFT_SAMPLES / 2U),
-               FFT_ADC_FS_HZ);
-
-        for (uint32_t k = FFT_MIN_BIN; k < (FFT_SAMPLES / 2U); k++)
-        {
-            float freq_hz = ((float)k * FFT_ADC_FS_HZ) / (float)FFT_SAMPLES;
-            float lam_k   = (freq_hz > 0.0f)
-                            ? (2.0f * v_mm_s / freq_hz) * 1.0e6f
-                            : 0.0f;
-            float mag_vs  = (fft_mag_accum[k] / (float)fft_chunks_processed)
-                            / ADC_MAX_COUNTS * ADC_VREF
-                            * ((float)FFT_CHUNK_HALF / FFT_ADC_FS_HZ);
-
-            printf("SPEC,%lu,%.4f,%.6f\r\n",
-                   (unsigned long)k, lam_k, mag_vs);
-
-            if ((k % 32U) == 0U) CDC_TX_Kick();
-        }
-
-        CDC_TX_Kick();
-        printf("SPECTRUM_END\r\n");
-        CDC_TX_Kick();
-
-        printf("FFT_DONE,valid=%lu,"
-               "f_avg_runs_hz=%.3f,"
-               "f_avg_spectrum_hz=%.3f,"
-               "lambda_nm=%.3f,"
-               "total_chunks=%lu,"
-               "formula=2*v/f,v_mm_s=%.3f\r\n",
-               (unsigned long)valid,
-               f_avg_single,
-               f_avg_spec,
-               lambda_nm,
-               (unsigned long)fft_chunks_processed,
-               v_mm_s);
-        CDC_TX_Kick();
-    }
-    else
-    {
-        printf("FFT_DONE,valid=0,f_avg_runs_hz=0.0,"
-               "f_avg_spectrum_hz=0.0,lambda_nm=0.0,"
-               "total_chunks=0,formula=2*v/f,v_mm_s=%.3f\r\n",
-               v_mm_s);
-        CDC_TX_Kick();
-    }
+    printf("WL_DONE,total_windows=%lu\r\n", (unsigned long)window_id);
+    CDC_TX_Kick();
 
     fft_busy = 0U;
 }
+
 
 // -----------------------------
 // UART command parser (USB CDC input)
@@ -7640,6 +8145,27 @@ void process_cmd_byte(uint8_t b)
         {
             printf("M2 CMD RECEIVED\r\n");
             start_m2_flag = 1U;
+        }
+
+        else if (strncmp(cmd_buf, M2_POS_CMD_PREFIX, strlen(M2_POS_CMD_PREFIX)) == 0)
+        {
+            float target_mm = 0.0f;
+            unsigned long step_index = 0UL;
+            int parsed = sscanf(cmd_buf, "M2POS,%f,%lu", &target_mm, &step_index);
+
+            if (parsed >= 1)
+            {
+                m2_target_z_mm = target_mm;
+                m2_target_step_index = (parsed >= 2) ? (uint32_t)step_index : 0U;
+                printf("M2POS CMD RECEIVED,target_z_mm=%.3f,step=%lu\r\n",
+                       m2_target_z_mm,
+                       (unsigned long)m2_target_step_index);
+                start_m2_position_flag = 1U;
+            }
+            else
+            {
+                printf("M2POS BAD CMD\r\n");
+            }
         }
 
         // Start beam profiling
@@ -7815,35 +8341,117 @@ static void clear_beam_on_startup(ProfileAxis_t axis)
     }
 }
 
-static void dc_clear_beam_until_low(float threshold_mw)
+static void clear_beam_on_startup_both(void)
 {
-    uint32_t stable_count = 0;
-    uint32_t last_print = HAL_GetTick();
+    uint32_t start_ms = HAL_GetTick();
+    uint32_t phase_start_ms;
+    uint32_t now;
+    uint8_t clear_count = 0U;
+    ProfileAxis_t axis = PROFILE_AXIS_M1;
+    DCMotor_t *active_motor;
 
-    while (stable_count < 5)   // require multiple confirmations
+    printf("STARTUP_CLEAR_BOTH_BEGIN\r\n");
+
+    dc_motors_stop_all();
+    HAL_Delay(50);
+
+    while ((HAL_GetTick() - start_ms) < 8000U)
+    {
+        axis = (axis == PROFILE_AXIS_M1) ? PROFILE_AXIS_M2 : PROFILE_AXIS_M1;
+        active_motor = (axis == PROFILE_AXIS_M1) ? &dc1 : &dc2;
+
+        printf("STARTUP_CLEAR_TRY,axis=%u\r\n", (unsigned int)axis);
+
+        dc_motor_start_profile_axis(axis);
+        HAL_Delay(PROFILE_SPINUP_MS);
+
+        phase_start_ms = HAL_GetTick();
+        last_dc_speed_ms = HAL_GetTick();
+        clear_count = 0U;
+
+        while ((HAL_GetTick() - phase_start_ms) < 1500U)
+        {
+            now = HAL_GetTick();
+
+            live_power_update_service();
+
+            if ((now - last_dc_speed_ms) >= DC_SPEED_SAMPLE_MS)
+            {
+                float dt_s = (float)(now - last_dc_speed_ms) / 1000.0f;
+
+                dc_update_speed(&dc1, ENC1_COUNTS_PER_REV, dt_s);
+                dc_update_speed(&dc2, ENC2_COUNTS_PER_REV, dt_s);
+
+                dc_motor_auto_correct_counts(active_motor);
+
+                last_dc_speed_ms = now;
+            }
+
+            // HIGH power = beam path is clear, so neither motor is blocking
+            if (latest_p_mw >= 0.2f)
+            {
+                if (clear_count < 50U)
+                    clear_count++;
+            }
+            else
+            {
+                clear_count = 0U;
+            }
+
+            if (clear_count >= 50U)
+            {
+                dc_motors_stop_all();
+                printf("STARTUP_CLEAR_BOTH_DONE,plive=%.4f\r\n", latest_p_mw);
+                return;
+            }
+        }
+
+        dc_motor_set_duty(active_motor, 0);
+        HAL_Delay(50);
+    }
+
+    dc_motors_stop_all();
+    printf("STARTUP_CLEAR_BOTH_TIMEOUT,plive=%.4f\r\n", latest_p_mw);
+}
+
+static void clear_beam_both_motors_startup(void)
+{
+    uint32_t start_ms = HAL_GetTick();
+    uint8_t cleared = 0U;
+
+    printf("STARTUP_CLEAR_BOTH_BEGIN\r\n");
+
+    dc_start_continuous();
+
+    while ((HAL_GetTick() - start_ms) < PROFILE_CLEAR_TIMEOUT_MS)
     {
         live_power_update_service();
 
-        if (latest_p_mw < threshold_mw)
+        float p = latest_p_mw;
+
+        printf("STARTUP_CLEAR_PWR,%.4f\r\n", p);
+
+        // LOW POWER = beam blocked / blade in path
+        if (p < PROFILE_CLEAR_THRESHOLD_MW)
         {
-            stable_count++;
-        }
-        else
-        {
-            stable_count = 0;
+            cleared = 1U;
+            printf("STARTUP_CLEAR_SUCCESS,p=%.4f\r\n", p);
+            break;
         }
 
-        // Keep motors running + correcting speed
-        uint32_t now = HAL_GetTick();
-        if ((now - last_print) > 300)
-        {
-            printf("CLEARING_BEAM,P=%.3f mW\r\n", latest_p_mw);
-            last_print = now;
-        }
+        HAL_Delay(5);
     }
 
-    printf("BEAM_CLEARED,P=%.3f mW\r\n", latest_p_mw);
+    if (!cleared)
+    {
+        printf("STARTUP_CLEAR_TIMEOUT\r\n");
+    }
+
+    dc_motors_stop_all();
+
+    printf("STARTUP_CLEAR_BOTH_DONE\r\n");
 }
+
 /* USER CODE END 0 */
 
 /**
@@ -7962,84 +8570,134 @@ int main(void)
 //		  HAL_Delay(5);
 //		  z_set_dir(Z_AWAY_DIR);
 //		  HAL_Delay(5);
-//		  z_move_steps(5000);
+//		  z_move_steps(30000);
+//		  stepper_sleep_disable();
 //	  }
 
+
+//	  stepper_sleep_wake();
+//	  drv_set_dir(1);
+//	  move_steps(5000);
+//	  drv_set_dir(0);
+//	  move_steps(5000);
+//	  stepper_sleep_disable();
 
 //	  steppers_run_continuous();
 
 
       live_power_update_service();
 
+//      stepper_sleep_wake();
+//      drv_set_dir(1);
+//      HAL_Delay(5);
+//      move_steps(5000);
+//      HAL_Delay(5);
+//      drv_set_dir(0);
+//      HAL_Delay(5);
+//      move_steps(5000);
+//      HAL_Delay(5);
+//      z_stepper_disable();
+
       // ✅ ONE-TIME startup beam clear
+//      if (!startup_clear_done)
+//      {
+//          clear_beam_on_startup_both();
+//          startup_clear_done = 1U;
+//      }
+
+//      if (!startup_clear_done)
+//      {
+//          clear_beam_on_startup(PROFILE_AXIS_M1);
+//          HAL_Delay(100);
+//
+//          clear_beam_on_startup(PROFILE_AXIS_M2);
+//
+//          startup_clear_done = 1U;
+//      }
+
       if (!startup_clear_done)
       {
-          clear_beam_on_startup(PROFILE_AXIS_M1);
-          HAL_Delay(100);
-
-          clear_beam_on_startup(PROFILE_AXIS_M2);
-
+          clear_beam_both_motors_startup();
           startup_clear_done = 1U;
       }
 
-      // Start divergence measurement
-	  if (start_divergence_flag && !stokes_busy && !t0_batch_active &&
-	      !fft_busy && !divergence_busy && !profiler.active && !profile_spinup_pending)
+      if (z_home_start_flag && !stokes_busy && !fft_busy &&
+          !divergence_busy && !profiler.active && !profile_spinup_pending)
+      {
+          z_home_start_flag = 0U;
+          z_home_simple(Z_HOME_DIR);
+          printf("ZHOME_DONE,z_mm=%.3f\r\n", z_current_mm);
+          continue;
+      }
+
+      if (start_divergence_flag && !stokes_busy && !t0_batch_active &&
+          !fft_busy && !divergence_busy && !profiler.active && !profile_spinup_pending)
+      {
+          start_divergence_flag = 0U;
+          run_divergence_measurement(DIVERGENCE_STEP_MM, DIVERGENCE_TOTAL_MM);
+          continue;
+      }
+
+//	  // Start Stokes
+	  if (start_stokes_flag && !stokes_busy & !profiler.active && !profile_spinup_pending && !divergence_busy)
 	  {
-	      start_divergence_flag = 0U;
-	      run_divergence_measurement(DIVERGENCE_STEP_MM, DIVERGENCE_TOTAL_MM);
-	      continue;
+		  start_stokes_flag = 0U;
+		  stokes_busy = 1U;
+
+		  printf("STOKES_BEGIN\r\n");
+		  do_stokes_scan();
+		  printf("STOKES_END\r\n");
+
+		  stokes_busy = 0U;
+		  continue;
 	  }
 
-//	  if (start_step_div_flag && !stokes_busy && !t0_batch_active &&
-//	      !fft_busy && !divergence_busy && !profiler.active && !profile_spinup_pending)
-//	  {
-//	      start_step_div_flag = 0U;
-//	      run_step_divergence(STEP_DIV_STEP_MM, STEP_DIV_NUM_POSITIONS);
-//	      continue;
-//	  }
-//
-//	  if (start_m2_flag && !stokes_busy && !t0_batch_active &&
-//	      !fft_busy && !divergence_busy && !profiler.active && !profile_spinup_pending)
-//	  {
-//	      start_m2_flag = 0U;
-//	      run_m2_measurement(M2_STEP_MM, M2_TOTAL_MM);
-//	      continue;
-//	  }
+      if (start_m2_flag && !stokes_busy && !t0_batch_active &&
+          !fft_busy && !divergence_busy && !profiler.active && !profile_spinup_pending)
+      {
+          start_m2_flag = 0U;
+          run_m2_measurement(M2_STEP_MM, M2_TOTAL_MM);
+          continue;
+      }
 
-//	    if (start_fft_flag && !fft_busy && !stokes_busy && !profiler.active && !divergence_busy)
-//	    {
-//	        start_fft_flag = 0U;
-//	        do_wavelength_fft_measurement();
-//	    }
-//
+      if (start_m2_position_flag && !stokes_busy && !t0_batch_active &&
+          !fft_busy && !divergence_busy && !profiler.active && !profile_spinup_pending)
+      {
+          uint32_t step_index = m2_target_step_index;
+          float target_mm = m2_target_z_mm;
 
-//      if (start_step_profile_flag && !stokes_busy && !t0_batch_active &&
-//          !fft_busy && !divergence_busy && !profiler.active && !profile_spinup_pending)
-//      {
-//          start_step_profile_flag = 0U;
-//          // 200 steps per move, 10 positions, axis 0
-//          // Adjust these constants or turn them into #defines as needed
-//          run_step_and_profile(200U, 10U, PROFILE_AXIS_M1);
-//      }
+          start_m2_position_flag = 0U;
+          if (step_index == 0U)
+              step_index = 1U;
+
+          run_m2_capture_at_position(target_mm, step_index);
+          continue;
+      }
+
+	    if (start_fft_flag && !fft_busy && !stokes_busy && !profiler.active && !divergence_busy)
+	    {
+	        start_fft_flag = 0U;
+	        do_wavelength_fft_measurement();
+	    }
 
 //	  if (start_t0_m1_flag && !stokes_busy && !t0_batch_active)
 //	  {
 //		  start_t0_m1_flag = 0U;
-//		  t0_batch_begin(PROFILE_AXIS_M1, 10U);
 //		  t0_batch_total_axes = 2U;
+//		  t0_batch_begin(PROFILE_AXIS_M1, 10U);
 //	  }
 //
 //	  if (start_t0_m2_flag && !stokes_busy && !t0_batch_active)
 //	  {
 //		  start_t0_m2_flag = 0U;
 //		  t0_batch_begin(PROFILE_AXIS_M2, 10U);
-//		  t0_batch_total_axes = 1U;
+//		  t0_batch_total_axes = 2U;
 //	  }
 
-//	  // Run the non-blocking T0 scheduler every loop
+	  // Run the non-blocking T0 scheduler every loop
 //	  t0_batch_update();
 
+//
 //	      uint32_t now = HAL_GetTick();
 //	      if ((now - last_dc_speed_ms) >= DC_SPEED_SAMPLE_MS)
 //	      {
@@ -8056,7 +8714,7 @@ int main(void)
 //	          last_dc_speed_ms = now;
 //	      }
 //
-
+//
 //	  if (host_cmd_start_axis0)
 //	  {
 //	      host_cmd_start_axis0 = 0U;
@@ -8132,18 +8790,6 @@ int main(void)
 //
 //	  host_profile_update();
 //
-//	  if (start_stokes_flag && !stokes_busy & !profiler.active && !profile_spinup_pending)
-//	  {
-//		  start_stokes_flag = 0U;
-//		  stokes_busy = 1U;
-//
-//		  printf("STOKES_BEGIN\r\n");
-//		  do_stokes_scan();
-//		  printf("STOKES_END\r\n");
-//
-//		  stokes_busy = 0U;
-//		  continue;
-//	  }
 
 //	      if (start_t0_m1_flag && !stokes_busy && !profiler.active && !profile_spinup_pending)
 //	      {
@@ -8699,7 +9345,11 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
   hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
-  hadc1.Init.OversamplingMode = DISABLE;
+  hadc1.Init.OversamplingMode = ENABLE;
+  hadc1.Init.Oversampling.Ratio = ADC_OVERSAMPLING_RATIO_4;
+  hadc1.Init.Oversampling.RightBitShift = ADC_RIGHTBITSHIFT_NONE;
+  hadc1.Init.Oversampling.TriggeredMode = ADC_TRIGGEREDMODE_SINGLE_TRIGGER;
+  hadc1.Init.Oversampling.OversamplingStopReset = ADC_REGOVERSAMPLING_CONTINUED_MODE;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
     Error_Handler();
@@ -8715,7 +9365,7 @@ static void MX_ADC1_Init(void)
 
   /** Configure Regular Channel
   */
-  sConfig.Channel = ADC_CHANNEL_6;
+  sConfig.Channel = ADC_CHANNEL_5;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLETIME_24CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
@@ -8862,7 +9512,7 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 95;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 49;
+  htim2.Init.Period = 99;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
@@ -9137,17 +9787,20 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3
                           |GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_4
-                          |GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_10
+                          |GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_12, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : PA0 PA1 PA2 PA3
                            PA4 PA5 PA6 */
@@ -9158,10 +9811,10 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PB0 PB1 PB2 PB4
-                           PB5 PB6 PB7 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_4
-                          |GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7;
+  /*Configure GPIO pins : PB0 PB1 PB2 PB10
+                           PB4 PB5 PB6 PB7 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_10
+                          |GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -9172,6 +9825,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PC12 */
+  GPIO_InitStruct.Pin = GPIO_PIN_12;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
